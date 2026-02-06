@@ -8,6 +8,7 @@ import (
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
@@ -232,7 +233,7 @@ func (h *DefaultHealthChecker) performHealthCheck(ctx context.Context, target *T
 		healthConfig = &cfg
 	}
 
-	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(healthConfig.CheckTimeoutSeconds)*time.Second)
+	checkCtx, cancel := context.WithTimeout(usage.WithSkipUsage(ctx), time.Duration(healthConfig.CheckTimeoutSeconds)*time.Second)
 	defer cancel()
 
 	startTime := time.Now()

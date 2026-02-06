@@ -322,6 +322,16 @@ func (e *DefaultRoutingEngine) selectLeastConnections(ctx context.Context, targe
 	return selected
 }
 
+// failoverFirstChunkTimeout is the maximum time to wait for the first stream chunk
+// during failover. If the target doesn't return any data within this period,
+// it is considered unresponsive and the next target is tried.
+const failoverFirstChunkTimeout = 10 * time.Second
+
+// failoverNonStreamTimeout is the maximum time for a single non-streaming request
+// attempt during failover. Non-streaming requests must receive the full response
+// body, so this is set higher than the streaming first-chunk timeout.
+const failoverNonStreamTimeout = 30 * time.Second
+
 // ExecuteWithFailover executes a request with automatic failover.
 func (e *DefaultRoutingEngine) ExecuteWithFailover(
 	ctx context.Context,
@@ -368,9 +378,11 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				continue
 			}
 
-			// Execute request
+			// Execute request with per-attempt timeout
 			attemptStart := time.Now()
-			err = executeFunc(ctx, auth, target.Model)
+			execCtx, execCancel := context.WithTimeout(ctx, failoverNonStreamTimeout)
+			err = executeFunc(execCtx, auth, target.Model)
+			execCancel()
 			attemptLatency := time.Since(attemptStart).Milliseconds()
 
 			if err == nil {
@@ -497,8 +509,41 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 				continue
 			}
 
-			// Got a channel, now wait for the first chunk to validate the connection
-			firstChunk, ok := <-chunks
+			// Got a channel, now wait for the first chunk to validate the connection.
+			// Apply a timeout so that an unresponsive target doesn't block failover.
+			var firstChunk cliproxyexecutor.StreamChunk
+			var ok bool
+
+			firstChunkTimer := time.NewTimer(failoverFirstChunkTimeout)
+			select {
+			case firstChunk, ok = <-chunks:
+				firstChunkTimer.Stop()
+			case <-firstChunkTimer.C:
+				// Target did not return any data within the timeout
+				attemptLatency := time.Since(attemptStart).Milliseconds()
+				errMsg := fmt.Sprintf("first chunk timeout (%s)", failoverFirstChunkTimeout)
+				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
+				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
+					Failed(errMsg)
+				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.metrics.RecordEvent(&RoutingEvent{
+					Type:     EventCooldownStarted,
+					RouteID:  decision.RouteID,
+					TargetID: target.ID,
+					Details: map[string]any{
+						"duration_seconds": int(cooldownDuration.Seconds()),
+						"reason":           errMsg,
+						"latency_ms":       attemptLatency,
+					},
+				})
+				// Drain remaining chunks in background to prevent goroutine leak
+				go func() {
+					for range chunks {
+					}
+				}()
+				continue
+			}
+
 			if !ok {
 				// Channel closed immediately without any data - treat as failure
 				attemptLatency := time.Since(attemptStart).Milliseconds()
