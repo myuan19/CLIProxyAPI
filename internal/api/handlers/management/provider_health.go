@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
@@ -222,7 +223,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 		testModel := models[0]
 
 		startTime := time.Now()
-		checkCtx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+		checkCtx, cancel := context.WithTimeout(usage.WithSkipUsage(context.Background()), time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
 
 		// Build minimal OpenAI-format request for health check
@@ -415,7 +416,7 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 		return
 	}
 
-	streamCtx, streamCancel := context.WithTimeout(c.Request.Context(), streamHealthCheckDeadline)
+	streamCtx, streamCancel := context.WithTimeout(usage.WithSkipUsage(c.Request.Context()), streamHealthCheckDeadline)
 	defer streamCancel()
 
 	resultCh := make(chan ProviderHealth, len(targetAuths))

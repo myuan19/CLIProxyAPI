@@ -104,9 +104,13 @@ func (m *Manager) Register(plugin Plugin) {
 }
 
 // Publish enqueues a usage record for processing. If no plugin is registered
-// the record will be discarded downstream.
+// the record will be discarded downstream. Records published through a context
+// that carries the skip-usage flag (see WithSkipUsage) are silently dropped.
 func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
+		return
+	}
+	if ShouldSkipUsage(ctx) {
 		return
 	}
 	// ensure worker is running even if Start was not called explicitly
@@ -170,6 +174,25 @@ func DefaultManager() *Manager { return defaultManager }
 
 // RegisterPlugin registers a plugin on the default manager.
 func RegisterPlugin(plugin Plugin) { DefaultManager().Register(plugin) }
+
+// contextKey is an unexported type for context keys in this package.
+type contextKey struct{ name string }
+
+var skipUsageKey = &contextKey{"skipUsage"}
+
+// WithSkipUsage returns a derived context that instructs the usage system
+// to silently discard any records published through it. This is used by
+// internal diagnostic paths (e.g. health checks) that send real requests
+// but should not pollute usage statistics.
+func WithSkipUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipUsageKey, true)
+}
+
+// ShouldSkipUsage reports whether ctx carries the skip-usage flag.
+func ShouldSkipUsage(ctx context.Context) bool {
+	v, _ := ctx.Value(skipUsageKey).(bool)
+	return v
+}
 
 // PublishRecord publishes a record using the default manager.
 func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }

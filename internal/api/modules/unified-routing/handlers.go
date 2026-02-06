@@ -1,8 +1,10 @@
 package unifiedrouting
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -466,27 +468,52 @@ func (h *Handlers) ForceCooldown(c *gin.Context) {
 
 // ================== Health ==================
 
+// streamHealthCheckDeadline is the overall deadline for streaming health checks.
+const streamHealthCheckDeadline = 30 * time.Second
+
 // TriggerHealthCheck triggers a health check.
+// When the Accept header is "text/event-stream" or stream=true query param is set,
+// results are streamed via SSE as each target check completes.
 func (h *Handlers) TriggerHealthCheck(c *gin.Context) {
 	routeID := c.Param("route_id")
 	targetID := c.Query("target_id")
 
-	var results []*HealthResult
-	var err error
+	// Check if streaming is requested
+	wantStream := c.Query("stream") == "true" || c.GetHeader("Accept") == "text/event-stream"
 
+	// Single target check — always non-streaming
 	if targetID != "" {
 		result, e := h.healthChecker.CheckTarget(c.Request.Context(), targetID)
 		if e != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": e.Error()})
 			return
 		}
-		results = []*HealthResult{result}
-	} else if routeID != "" {
+		c.JSON(http.StatusOK, gin.H{
+			"checked_at": time.Now(),
+			"results":    []*HealthResult{result},
+		})
+		return
+	}
+
+	// Collect targets to check
+	targets, err := h.collectTargets(c.Request.Context(), routeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if wantStream {
+		h.triggerHealthCheckStream(c, targets)
+		return
+	}
+
+	// Non-streaming fallback: check sequentially
+	var results []*HealthResult
+	if routeID != "" {
 		results, err = h.healthChecker.CheckRoute(c.Request.Context(), routeID)
 	} else {
 		results, err = h.healthChecker.CheckAll(c.Request.Context())
 	}
-
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -496,6 +523,121 @@ func (h *Handlers) TriggerHealthCheck(c *gin.Context) {
 		"checked_at": time.Now(),
 		"results":    results,
 	})
+}
+
+// collectTargets gathers all enabled targets for the given route (or all routes if routeID is empty).
+func (h *Handlers) collectTargets(ctx context.Context, routeID string) ([]Target, error) {
+	var routes []*Route
+	var err error
+
+	if routeID != "" {
+		route, e := h.configSvc.GetRoute(ctx, routeID)
+		if e != nil {
+			return nil, e
+		}
+		routes = []*Route{route}
+	} else {
+		routes, err = h.configSvc.ListRoutes(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var targets []Target
+	for _, route := range routes {
+		pipeline, e := h.configSvc.GetPipeline(ctx, route.ID)
+		if e != nil {
+			continue
+		}
+		for _, layer := range pipeline.Layers {
+			for _, target := range layer.Targets {
+				if target.Enabled {
+					targets = append(targets, target)
+				}
+			}
+		}
+	}
+	return targets, nil
+}
+
+// triggerHealthCheckStream runs health checks concurrently and streams each result via SSE.
+func (h *Handlers) triggerHealthCheckStream(c *gin.Context, targets []Target) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming not supported"})
+		return
+	}
+
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), streamHealthCheckDeadline)
+	defer streamCancel()
+
+	resultCh := make(chan *HealthResult, len(targets))
+	completed := make(map[string]bool)
+	var completedMu sync.Mutex
+	var writeMu sync.Mutex
+
+	sendEvent := func(event string, data interface{}) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		c.SSEvent(event, data)
+		flusher.Flush()
+	}
+
+	// Launch concurrent health checks
+	for _, target := range targets {
+		go func(t Target) {
+			result, err := h.healthChecker.CheckTarget(streamCtx, t.ID)
+			if err != nil {
+				resultCh <- &HealthResult{
+					TargetID:     t.ID,
+					CredentialID: t.CredentialID,
+					Model:        t.Model,
+					Status:       "unhealthy",
+					Message:      err.Error(),
+					CheckedAt:    time.Now(),
+				}
+				return
+			}
+			resultCh <- result
+		}(target)
+	}
+
+	// Collect and stream results
+	received := 0
+	for received < len(targets) {
+		select {
+		case r := <-resultCh:
+			completedMu.Lock()
+			completed[r.TargetID] = true
+			completedMu.Unlock()
+			sendEvent("result", r)
+			received++
+		case <-streamCtx.Done():
+			goto done
+		}
+	}
+done:
+	// Report any targets that didn't finish in time
+	for _, t := range targets {
+		completedMu.Lock()
+		isDone := completed[t.ID]
+		completedMu.Unlock()
+		if !isDone {
+			sendEvent("result", &HealthResult{
+				TargetID:     t.ID,
+				CredentialID: t.CredentialID,
+				Model:        t.Model,
+				Status:       "timeout",
+				Message:      "health check timeout",
+				CheckedAt:    time.Now(),
+			})
+		}
+	}
+	sendEvent("done", gin.H{"event": "done"})
 }
 
 // GetHealthSettings returns health check settings.
