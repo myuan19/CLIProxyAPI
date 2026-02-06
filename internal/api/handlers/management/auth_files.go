@@ -2196,10 +2196,12 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 type ModelHealth struct {
 	ModelID     string `json:"model_id"`
 	DisplayName string `json:"display_name,omitempty"`
-	Status      string `json:"status"` // "healthy", "unhealthy"
+	Status      string `json:"status"` // "healthy", "unhealthy", "timeout"
 	Message     string `json:"message,omitempty"`
 	Latency     int64  `json:"latency_ms,omitempty"`
 }
+
+const streamAuthFileHealthCheckDeadline = 30 * time.Second
 
 // CheckAuthFileModelsHealth performs health checks on all models supported by an auth file
 // Mimics Cherry Studio's implementation: sends actual generation request and aborts after first chunk
@@ -2218,6 +2220,7 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 
 	// Parse optional query parameters (like Cherry Studio)
 	isConcurrent := c.DefaultQuery("concurrent", "false") == "true"
+	useStream := c.DefaultQuery("stream", "false") == "true"
 	timeoutSeconds := 15
 	if ts := c.Query("timeout"); ts != "" {
 		if parsed, err := strconv.Atoi(ts); err == nil && parsed >= 5 && parsed <= 60 {
@@ -2289,6 +2292,11 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 			"total_count":    0,
 			"models":         []ModelHealth{},
 		})
+		return
+	}
+
+	if useStream {
+		h.checkAuthFileModelsHealthStream(c, targetAuth, models, timeoutSeconds)
 		return
 	}
 
@@ -2465,4 +2473,126 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 		"total_count":    len(results),
 		"models":         results,
 	})
+}
+
+// checkAuthFileModelsHealthStream runs health checks per model and streams each result via SSE.
+// Overall deadline is streamAuthFileHealthCheckDeadline (30s); any model not done by then is reported as "timeout".
+func (h *Handler) checkAuthFileModelsHealthStream(c *gin.Context, targetAuth *coreauth.Auth, models []*registry.ModelInfo, timeoutSeconds int) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming not supported"})
+		return
+	}
+
+	streamCtx, streamCancel := context.WithTimeout(c.Request.Context(), streamAuthFileHealthCheckDeadline)
+	defer streamCancel()
+
+	resultCh := make(chan ModelHealth, len(models))
+	completed := make(map[string]bool)
+	var completedMu sync.Mutex
+	var writeMu sync.Mutex
+	sendEvent := func(event string, data interface{}) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		c.SSEvent(event, data)
+		flusher.Flush()
+	}
+
+	runOne := func(model *registry.ModelInfo) {
+		startTime := time.Now()
+		checkCtx, cancel := context.WithTimeout(streamCtx, time.Duration(timeoutSeconds)*time.Second)
+		defer cancel()
+		openAIRequest := map[string]interface{}{
+			"model": model.ID,
+			"messages": []map[string]interface{}{
+				{"role": "user", "content": "hi"},
+				{"role": "system", "content": "test"},
+			},
+			"stream": true, "max_tokens": 1,
+		}
+		requestJSON, err := json.Marshal(openAIRequest)
+		if err != nil {
+			resultCh <- ModelHealth{
+				ModelID: model.ID, DisplayName: model.DisplayName,
+				Status: "unhealthy", Message: fmt.Sprintf("failed to build request: %v", err),
+			}
+			return
+		}
+		req := cliproxyexecutor.Request{Model: model.ID, Payload: requestJSON, Format: sdktranslator.FormatOpenAI}
+		opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: requestJSON}
+		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, targetAuth, req, opts)
+		if err != nil {
+			resultCh <- ModelHealth{
+				ModelID: model.ID, DisplayName: model.DisplayName,
+				Status: "unhealthy", Message: err.Error(),
+			}
+			return
+		}
+		select {
+		case chunk, ok := <-stream:
+			if ok {
+				if chunk.Err != nil {
+					resultCh <- ModelHealth{
+						ModelID: model.ID, DisplayName: model.DisplayName,
+						Status: "unhealthy", Message: chunk.Err.Error(),
+					}
+					cancel()
+					go func() { for range stream {} }()
+					return
+				}
+				latency := time.Since(startTime).Milliseconds()
+				cancel()
+				go func() { for range stream {} }()
+				resultCh <- ModelHealth{
+					ModelID: model.ID, DisplayName: model.DisplayName,
+					Status: "healthy", Latency: latency,
+				}
+			} else {
+				resultCh <- ModelHealth{
+					ModelID: model.ID, DisplayName: model.DisplayName,
+					Status: "unhealthy", Message: "stream closed without data",
+				}
+			}
+		case <-checkCtx.Done():
+			resultCh <- ModelHealth{
+				ModelID: model.ID, DisplayName: model.DisplayName,
+				Status: "unhealthy", Message: "health check timeout",
+			}
+		}
+	}
+
+	for _, model := range models {
+		go runOne(model)
+	}
+
+	received := 0
+	for received < len(models) {
+		select {
+		case r := <-resultCh:
+			completedMu.Lock()
+			completed[r.ModelID] = true
+			completedMu.Unlock()
+			sendEvent("result", r)
+			received++
+		case <-streamCtx.Done():
+			goto done
+		}
+	}
+done:
+	for _, model := range models {
+		completedMu.Lock()
+		done := completed[model.ID]
+		completedMu.Unlock()
+		if !done {
+			sendEvent("result", ModelHealth{
+				ModelID: model.ID, DisplayName: model.DisplayName,
+				Status: "timeout", Message: "超过30s未完成",
+			})
+		}
+	}
+	sendEvent("done", gin.H{"event": "done"})
 }

@@ -62,8 +62,19 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
-# Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
+# Proxy URL. Supports socks5/http/https/ss (Shadowsocks) protocols.
+# Examples:
+#   socks5://user:pass@192.168.1.1:1080
+#   http://192.168.1.1:8080
+#   ss://aes-256-gcm:password@192.168.1.1:8388
+#   ss://BASE64(method:password)@192.168.1.1:8388  (SIP002 format)
 proxy-url: ""
+
+# DNS server for resolving SS proxy server hostnames (DoT format: tls://host:port).
+# Only used when proxy-url uses the ss:// scheme. Leave empty to use system DNS.
+# Some VPN providers require a specific DNS server to resolve their server hostnames.
+# Example: tls://112.74.48.57:10853
+proxy-dns: ""
 
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
@@ -101,7 +112,8 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://generativelanguage.googleapis.com"
 #     headers:
 #       X-Custom-Header: "custom-value"
-#     proxy-url: "socks5://proxy.example.com:1080"
+#     proxy-url: "socks5://proxy.example.com:1080" # or ss://method:password@host:port
+#     proxy-dns: "tls://dns.example.com:853"      # DoT DNS for SS proxy (optional)
 #     models:
 #       - name: "gemini-2.5-flash" # upstream model name
 #         alias: "gemini-flash"    # client alias mapped to the upstream model
@@ -119,7 +131,8 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     headers:
 #       X-Custom-Header: "custom-value"
-#     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     proxy-url: "socks5://proxy.example.com:1080" # or ss://method:password@host:port
+#     proxy-dns: "tls://dns.example.com:853"      # DoT DNS for SS proxy (optional)
 #     models:
 #       - name: "gpt-5-codex"   # upstream model name
 #         alias: "codex-latest" # client alias mapped to the upstream model
@@ -137,7 +150,8 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://www.example.com" # use the custom claude API endpoint
 #     headers:
 #       X-Custom-Header: "custom-value"
-#     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     proxy-url: "socks5://proxy.example.com:1080" # or ss://method:password@host:port
+#     proxy-dns: "tls://dns.example.com:853"      # DoT DNS for SS proxy (optional)
 #     models:
 #       - name: "claude-3-5-sonnet-20241022" # upstream model name
 #         alias: "claude-sonnet-latest"      # client alias mapped to the upstream model
@@ -165,7 +179,8 @@ nonstream-keepalive-interval: 0
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
 #       - api-key: "sk-or-v1-...b780"
-#         proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#         proxy-url: "socks5://proxy.example.com:1080" # or ss://method:password@host:port
+#         proxy-dns: "tls://dns.example.com:853"       # DoT DNS for SS proxy (optional)
 #       - api-key: "sk-or-v1-...b781" # without proxy-url
 #     models: # The models supported by the provider.
 #       - name: "moonshotai/kimi-k2:free" # The actual model name.
@@ -176,7 +191,8 @@ nonstream-keepalive-interval: 0
 #   - api-key: "vk-123..."                        # x-goog-api-key header
 #     prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
 #     base-url: "https://example.com/api"         # e.g. https://zenmux.ai/api
-#     proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
+#     proxy-url: "socks5://proxy.example.com:1080" # or ss://method:password@host:port
+#     proxy-dns: "tls://dns.example.com:853"      # DoT DNS for SS proxy (optional)
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     models:                                     # optional: map aliases to upstream model names
