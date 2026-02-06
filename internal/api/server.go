@@ -821,37 +821,101 @@ func (s *Server) unifiedGeminiModelsHandler(geminiHandler *gemini.GeminiAPIHandl
 	}
 }
 
+// buildRouteAliasModels returns route alias entries formatted as model objects.
+func buildRouteAliasModels(routeNames []string) []map[string]any {
+	models := make([]map[string]any, len(routeNames))
+	for i, name := range routeNames {
+		models[i] = map[string]any{
+			"id":       name,
+			"object":   "model",
+			"created":  1700000000,
+			"owned_by": "unified-routing",
+		}
+	}
+	return models
+}
+
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint
 // that routes to different handlers based on the User-Agent header.
 // If User-Agent starts with "claude-cli", it routes to Claude handler,
 // otherwise it routes to OpenAI handler.
-// When unified routing is enabled with hide_original_models=true, only route aliases are returned.
+// When unified routing is enabled:
+//   - hide_original_models=true:  only route aliases are returned.
+//   - hide_original_models=false: original models + route aliases are returned.
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Check if unified routing should hide original models
+		// Check if unified routing is active
 		if s.unifiedRoutingModule != nil {
 			engine := s.unifiedRoutingModule.GetEngine()
 			if engine != nil {
 				isEnabled := engine.IsEnabled(c.Request.Context())
 				shouldHide := engine.ShouldHideOriginalModels(c.Request.Context())
 				log.Debugf("[UnifiedRouting] /v1/models check: enabled=%v, hideOriginal=%v", isEnabled, shouldHide)
-				
-				if shouldHide {
-					// Return only route aliases as models
+
+				if isEnabled {
 					routeNames := engine.GetRouteNames(c.Request.Context())
-					log.Debugf("[UnifiedRouting] Returning %d route aliases as models: %v", len(routeNames), routeNames)
-					models := make([]map[string]any, len(routeNames))
-					for i, name := range routeNames {
-						models[i] = map[string]any{
-							"id":       name,
-							"object":   "model",
-							"created":  1700000000,
-							"owned_by": "unified-routing",
-						}
+					routeModels := buildRouteAliasModels(routeNames)
+
+					if shouldHide {
+						// Return only route aliases
+						log.Debugf("[UnifiedRouting] Returning %d route aliases as models: %v", len(routeNames), routeNames)
+						c.JSON(200, gin.H{
+							"object": "list",
+							"data":   routeModels,
+						})
+						return
 					}
+
+					// Not hiding originals – merge originals + route aliases.
+					userAgent := c.GetHeader("User-Agent")
+					isClaude := strings.HasPrefix(userAgent, "claude-cli")
+
+					if isClaude {
+						// Claude format: data[], has_more, first_id, last_id
+						origModels := claudeHandler.Models()
+						merged := append(origModels, routeModels...)
+						firstID := ""
+						lastID := ""
+						if len(merged) > 0 {
+							if id, ok := merged[0]["id"].(string); ok {
+								firstID = id
+							}
+							if id, ok := merged[len(merged)-1]["id"].(string); ok {
+								lastID = id
+							}
+						}
+						log.Debugf("[UnifiedRouting] Returning %d original + %d route alias models (claude format)", len(origModels), len(routeModels))
+						c.JSON(200, gin.H{
+							"data":     merged,
+							"has_more": false,
+							"first_id": firstID,
+							"last_id":  lastID,
+						})
+						return
+					}
+
+					// OpenAI format: object=list, data[]
+					allModels := openaiHandler.Models()
+					// Filter to standard fields like OpenAIModels does
+					filteredModels := make([]map[string]any, 0, len(allModels)+len(routeModels))
+					for _, model := range allModels {
+						filtered := map[string]any{
+							"id":     model["id"],
+							"object": model["object"],
+						}
+						if created, exists := model["created"]; exists {
+							filtered["created"] = created
+						}
+						if ownedBy, exists := model["owned_by"]; exists {
+							filtered["owned_by"] = ownedBy
+						}
+						filteredModels = append(filteredModels, filtered)
+					}
+					filteredModels = append(filteredModels, routeModels...)
+					log.Debugf("[UnifiedRouting] Returning %d original + %d route alias models (openai format)", len(allModels), len(routeModels))
 					c.JSON(200, gin.H{
 						"object": "list",
-						"data":   models,
+						"data":   filteredModels,
 					})
 					return
 				}
@@ -862,14 +926,11 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			log.Debugf("[UnifiedRouting] /v1/models: module is nil")
 		}
 
+		// Unified routing not active – delegate to original handlers
 		userAgent := c.GetHeader("User-Agent")
-
-		// Route to Claude handler if User-Agent starts with "claude-cli"
 		if strings.HasPrefix(userAgent, "claude-cli") {
-			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
 			claudeHandler.ClaudeModels(c)
 		} else {
-			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
 			openaiHandler.OpenAIModels(c)
 		}
 	}
