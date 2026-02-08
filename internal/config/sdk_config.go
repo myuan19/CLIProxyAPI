@@ -21,6 +21,15 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// DetailedRequestLog enables structured detailed request logging with API key association.
+	// When enabled, all proxied requests are recorded as structured JSON records for browsing
+	// via the management panel, including retry grouping and per-API-key filtering.
+	DetailedRequestLog bool `yaml:"detailed-request-log" json:"detailed-request-log"`
+
+	// DetailedRequestLogMaxSizeMB limits the total size (in MB) of the detailed request log file.
+	// When exceeded, the oldest records are removed. Default is 100 MB. Set to 0 for default.
+	DetailedRequestLogMaxSizeMB int `yaml:"detailed-request-log-max-size-mb,omitempty" json:"detailed-request-log-max-size-mb,omitempty"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 

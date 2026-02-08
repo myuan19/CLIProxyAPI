@@ -144,6 +144,9 @@ type Server struct {
 	requestLogger logging.RequestLogger
 	loggerToggle  func(bool)
 
+	// detailedLogger handles structured detailed request logging with API key tracking.
+	detailedLogger *logging.DetailedRequestLogger
+
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
 
@@ -233,6 +236,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		}
 	}
 
+	// Initialize detailed request logger (positioned after request logging middleware)
+	var detailedLogger *logging.DetailedRequestLogger
+	if !cfg.CommercialMode {
+		detailedLogsDir := filepath.Join(logging.ResolveLogDirectory(cfg), "detailed-requests")
+		maxSizeMB := cfg.DetailedRequestLogMaxSizeMB
+		if maxSizeMB <= 0 {
+			maxSizeMB = 20
+		}
+		detailedLogger = logging.NewDetailedRequestLogger(cfg.DetailedRequestLog, detailedLogsDir, maxSizeMB)
+		engine.Use(middleware.DetailedRequestLoggingMiddleware(detailedLogger))
+	}
+
 	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
 	if err != nil {
@@ -251,6 +266,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		accessManager:       accessManager,
 		requestLogger:       requestLogger,
 		loggerToggle:        toggle,
+		detailedLogger:      detailedLogger,
 		configFilePath:      configFilePath,
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
@@ -272,6 +288,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
+	if detailedLogger != nil {
+		s.mgmt.SetDetailedLogger(detailedLogger)
+	}
 	s.localPassword = optionState.localPassword
 
 	// Setup routes
@@ -330,6 +349,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/detailed-requests.html", func(c *gin.Context) {
+		if s.mgmt != nil {
+			s.mgmt.ServeDetailedRequestsPage(c)
+		} else {
+			c.AbortWithStatus(http.StatusNotFound)
+		}
+	})
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -559,6 +585,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
 		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
 		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
+
+		mgmt.GET("/detailed-request-log", s.mgmt.GetDetailedRequestLog)
+		mgmt.PUT("/detailed-request-log", s.mgmt.PutDetailedRequestLog)
+		mgmt.PATCH("/detailed-request-log", s.mgmt.PutDetailedRequestLog)
+		mgmt.GET("/detailed-requests", s.mgmt.ListDetailedRequests)
+		mgmt.GET("/detailed-requests/:id", s.mgmt.GetDetailedRequest)
+		mgmt.DELETE("/detailed-requests", s.mgmt.DeleteDetailedRequests)
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
@@ -709,8 +742,22 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
-	c.File(filePath)
+	// Read the HTML file and inject the detailed-requests tab script before </body>
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.WithError(err).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	html := string(data)
+	injectTag := "<script>" + managementHandlers.InjectScript() + "</script>"
+	html = strings.Replace(html, "</body>", injectTag+"</body>", 1)
+
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, html)
 }
+
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
 	if timeout <= 0 || onTimeout == nil {
@@ -1543,6 +1590,24 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			s.loggerToggle(cfg.RequestLog)
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
 			toggler.SetEnabled(cfg.RequestLog)
+		}
+	}
+
+	// Update detailed request logger state if it has changed
+	if s.detailedLogger != nil {
+		prevDetailedLog := false
+		if oldCfg != nil {
+			prevDetailedLog = oldCfg.DetailedRequestLog
+		}
+		if oldCfg == nil || prevDetailedLog != cfg.DetailedRequestLog {
+			s.detailedLogger.SetEnabled(cfg.DetailedRequestLog)
+		}
+		prevMaxSize := 0
+		if oldCfg != nil {
+			prevMaxSize = oldCfg.DetailedRequestLogMaxSizeMB
+		}
+		if oldCfg == nil || prevMaxSize != cfg.DetailedRequestLogMaxSizeMB {
+			s.detailedLogger.SetMaxSizeMB(cfg.DetailedRequestLogMaxSizeMB)
 		}
 	}
 
