@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -47,6 +48,7 @@ type Handler struct {
 	allowRemoteOverride bool
 	envSecret           string
 	logDir              string
+	detailedLogger      *logging.DetailedRequestLogger
 }
 
 // NewHandler creates a new management handler instance.
@@ -114,6 +116,11 @@ func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageSt
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
+
+// SetDetailedLogger sets the detailed request logger instance.
+func (h *Handler) SetDetailedLogger(logger *logging.DetailedRequestLogger) {
+	h.detailedLogger = logger
+}
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
