@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	unifiedrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/unified-routing"
+	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -1035,6 +1036,13 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 
 			stream := gjson.GetBytes(rawBody, "stream").Bool()
 
+			// Normalize OpenAI Responses-format payloads (with "input" instead of "messages")
+			// to Chat Completions format so downstream translators can process them correctly.
+			if sourceFormat == sdktranslator.FormatOpenAI {
+				rawBody = normalizeResponsesFormat(rawBody, modelName, stream)
+				stream = gjson.GetBytes(rawBody, "stream").Bool()
+			}
+
 			// Use ExecuteWithFailover for full multi-layer failover support
 			s.executeWithUnifiedRoutingFailoverFormat(c, engine, modelName, rawBody, stream, sourceFormat)
 			return
@@ -1784,4 +1792,21 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Authentication service error"})
 		}
 	}
+}
+
+// normalizeResponsesFormat converts OpenAI Responses-format payloads (with "input"
+// instead of "messages") to standard Chat Completions format so that downstream
+// translators can process them correctly. If the payload already uses "messages",
+// it is returned unchanged.
+func normalizeResponsesFormat(rawBody []byte, modelName string, stream bool) []byte {
+	// Same detection logic as openai_handlers.shouldTreatAsResponsesFormat:
+	// If "messages" exists, it's already in Chat Completions format.
+	if gjson.GetBytes(rawBody, "messages").Exists() {
+		return rawBody
+	}
+	// If "input" or "instructions" exists (without "messages"), treat as Responses format.
+	if gjson.GetBytes(rawBody, "input").Exists() || gjson.GetBytes(rawBody, "instructions").Exists() {
+		return responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawBody, stream)
+	}
+	return rawBody
 }
