@@ -197,11 +197,12 @@ type RoutingEvent struct {
 type RoutingEventType string
 
 const (
-	EventTargetFailed    RoutingEventType = "target_failed"
-	EventTargetRecovered RoutingEventType = "target_recovered"
-	EventLayerFallback   RoutingEventType = "layer_fallback"
-	EventCooldownStarted RoutingEventType = "cooldown_started"
-	EventCooldownEnded   RoutingEventType = "cooldown_ended"
+	EventTargetFailed     RoutingEventType = "target_failed"
+	EventTargetRecovered  RoutingEventType = "target_recovered"
+	EventLayerFallback    RoutingEventType = "layer_fallback"
+	EventCooldownStarted  RoutingEventType = "cooldown_started"
+	EventCooldownEnded    RoutingEventType = "cooldown_ended"
+	EventNonRetryableError RoutingEventType = "non_retryable_error"
 )
 
 // ================== Statistics Types ==================
