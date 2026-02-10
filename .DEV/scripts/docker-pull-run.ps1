@@ -318,6 +318,7 @@ try {
     Write-Host "服务信息:" -ForegroundColor Cyan
     Write-Info "访问地址:" "http://localhost:$HostPort"
     Write-Info "管理面板:" "http://localhost:$HostPort/management.html"
+    Write-Info "请求详情:" "http://localhost:$HostPort/management.html#/detailed-requests"
     Write-Info "API 端点:" "http://localhost:$HostPort/v1/models"
     Write-Host ""
     Write-Host "常用命令:" -ForegroundColor Cyan

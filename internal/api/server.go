@@ -350,13 +350,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
-	s.engine.GET("/detailed-requests.html", func(c *gin.Context) {
-		if s.mgmt != nil {
-			s.mgmt.ServeDetailedRequestsPage(c)
-		} else {
-			c.AbortWithStatus(http.StatusNotFound)
-		}
-	})
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -743,20 +736,8 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
-	// Read the HTML file and inject the detailed-requests tab script before </body>
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		log.WithError(err).Error("failed to read management control panel asset")
-		c.AbortWithStatus(http.StatusInternalServerError)
-		return
-	}
-
-	html := string(data)
-	injectTag := "<script>" + managementHandlers.InjectScript() + "</script>"
-	html = strings.Replace(html, "</body>", injectTag+"</body>", 1)
-
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, html)
+	c.File(filePath)
 }
 
 

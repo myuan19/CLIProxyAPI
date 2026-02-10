@@ -138,10 +138,18 @@ func (e *DefaultRoutingEngine) GetRouteNames(ctx context.Context) []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	names := make([]string, 0, len(e.routeIndex))
+	// Deduplicate: routeIndex maps multiple keys (name + aliases) to the same route
+	seen := make(map[string]bool)
+	var names []string
 	for _, route := range e.routeIndex {
-		if route.Enabled {
-			names = append(names, route.Name)
+		if !route.Enabled {
+			continue
+		}
+		for _, name := range route.AllNames() {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
 		}
 	}
 	return names
@@ -183,7 +191,10 @@ func (e *DefaultRoutingEngine) Reload(ctx context.Context) error {
 	newPipelineIndex := make(map[string]*Pipeline, len(routes))
 
 	for _, route := range routes {
-		newRouteIndex[strings.ToLower(route.Name)] = route
+		// Index by primary name and all aliases
+		for _, name := range route.AllNames() {
+			newRouteIndex[strings.ToLower(name)] = route
+		}
 
 		pipeline, err := e.configSvc.GetPipeline(ctx, route.ID)
 		if err != nil {
