@@ -2039,6 +2039,12 @@ func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
 	return p.RoundTripperFor(auth)
 }
 
+// ProxyUsedForAuth returns true if the given auth would use a proxy (non-nil RoundTripper from provider).
+// Used by health check endpoints to report whether the request went through the configured proxy.
+func (m *Manager) ProxyUsedForAuth(auth *Auth) bool {
+	return m.roundTripperFor(auth) != nil
+}
+
 // RoundTripperProvider defines a minimal provider of per-auth HTTP transports.
 type RoundTripperProvider interface {
 	RoundTripperFor(auth *Auth) http.RoundTripper
