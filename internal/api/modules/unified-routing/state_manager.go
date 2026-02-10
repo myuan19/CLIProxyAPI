@@ -31,26 +31,19 @@ type StateManager interface {
 
 // DefaultStateManager implements StateManager.
 type DefaultStateManager struct {
-	store        StateStore
-	configSvc    ConfigService
-	mu           sync.RWMutex
-	cooldownChan chan string // Channel for cooldown expiry notifications
-	stopChan     chan struct{}
+	store     StateStore
+	configSvc ConfigService
+	mu        sync.RWMutex
+	stopChan  chan struct{}
 }
 
 // NewStateManager creates a new state manager.
 func NewStateManager(store StateStore, configSvc ConfigService) *DefaultStateManager {
-	sm := &DefaultStateManager{
-		store:        store,
-		configSvc:    configSvc,
-		cooldownChan: make(chan string, 100),
-		stopChan:     make(chan struct{}),
+	return &DefaultStateManager{
+		store:     store,
+		configSvc: configSvc,
+		stopChan:  make(chan struct{}),
 	}
-
-	// Start cooldown monitor
-	go sm.monitorCooldowns()
-
-	return sm
 }
 
 func (m *DefaultStateManager) GetOverview(ctx context.Context) (*StateOverview, error) {
@@ -241,24 +234,15 @@ func (m *DefaultStateManager) StartCooldown(ctx context.Context, targetID string
 		state = &TargetState{TargetID: targetID}
 	}
 
+	// CooldownEndsAt serves as a safety-net: if the health checker is not
+	// running, GetTargetState will auto-recover the target after this time.
+	// The primary recovery mechanism is the background health checker which
+	// proactively checks all cooling targets on every cycle.
 	cooldownEnd := time.Now().Add(duration)
 	state.Status = StatusCooling
 	state.CooldownEndsAt = &cooldownEnd
 
 	_ = m.store.SetTargetState(ctx, state)
-
-	// Schedule cooldown expiry
-	go func() {
-		timer := time.NewTimer(duration)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			m.cooldownChan <- targetID
-		case <-m.stopChan:
-			return
-		}
-	}()
 }
 
 func (m *DefaultStateManager) EndCooldown(ctx context.Context, targetID string) {
@@ -305,29 +289,6 @@ func (m *DefaultStateManager) InitializeTarget(ctx context.Context, targetID str
 
 func (m *DefaultStateManager) RemoveTarget(ctx context.Context, targetID string) error {
 	return m.store.DeleteTargetState(ctx, targetID)
-}
-
-func (m *DefaultStateManager) monitorCooldowns() {
-	for {
-		select {
-		case targetID := <-m.cooldownChan:
-			ctx := context.Background()
-			state, err := m.store.GetTargetState(ctx, targetID)
-			if err != nil || state == nil {
-				continue
-			}
-
-			// Check if still in cooldown and cooldown has expired
-			if state.Status == StatusCooling && state.CooldownEndsAt != nil {
-				if time.Now().After(*state.CooldownEndsAt) {
-					m.EndCooldown(ctx, targetID)
-				}
-			}
-
-		case <-m.stopChan:
-			return
-		}
-	}
 }
 
 // Stop stops the state manager background tasks.

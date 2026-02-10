@@ -399,19 +399,20 @@ func (h *DefaultHealthChecker) checkCoolingTargets(ctx context.Context) {
 			continue
 		}
 
-		// Check if cooldown has expired
-		if state.CooldownEndsAt == nil || time.Now().After(*state.CooldownEndsAt) {
-			// Perform health check
-			result, err := h.CheckTarget(ctx, state.TargetID)
-			if err != nil {
-				log.Debugf("health check failed for target %s: %v", state.TargetID, err)
-				continue
-			}
+		// Health check is the primary recovery mechanism.
+		// Check ALL cooling targets on every cycle — don't wait for
+		// cooldown to expire. The cooldown timer (CooldownEndsAt) only
+		// serves as a safety net for automatic recovery when the health
+		// checker is not running.
+		result, err := h.CheckTarget(ctx, state.TargetID)
+		if err != nil {
+			log.Debugf("health check failed for target %s: %v", state.TargetID, err)
+			continue
+		}
 
-			if result.Status == "healthy" {
-				h.stateMgr.EndCooldown(ctx, state.TargetID)
-				log.Infof("target %s recovered after health check", state.TargetID)
-			}
+		if result.Status == "healthy" {
+			h.stateMgr.EndCooldown(ctx, state.TargetID)
+			log.Infof("target %s recovered after health check", state.TargetID)
 		}
 	}
 }

@@ -407,12 +407,32 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				return nil
 			}
 
-			// Failure - immediately start cooldown and try next target in this layer
+			// Classify the error to decide whether to retry on another target
+			errClass := ClassifyError(err)
+
+			if errClass == ErrorClassNonRetryable {
+				// Request-level problem — retrying on a different target will
+				// produce the same failure. Return immediately without cooldown.
+				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
+					Failed(err.Error())
+				e.metrics.RecordEvent(&RoutingEvent{
+					Type:    EventNonRetryableError,
+					RouteID: decision.RouteID,
+					Details: map[string]any{
+						"error":       err.Error(),
+						"error_class": errClass.String(),
+					},
+				})
+				log.Debugf("[UnifiedRouting] Non-retryable error, returning immediately: %v", err)
+				trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
+				e.metrics.RecordRequest(trace)
+				return err
+			}
+
+			// Retryable (node-level) failure — cooldown this target and try next
 			e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
 			traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 				Failed(err.Error())
-
-			// Start cooldown immediately on failure
 			e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
 			e.metrics.RecordEvent(&RoutingEvent{
 				Type:     EventCooldownStarted,
@@ -421,6 +441,7 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				Details: map[string]any{
 					"duration_seconds": int(cooldownDuration.Seconds()),
 					"reason":           err.Error(),
+					"error_class":      errClass.String(),
 				},
 			})
 
@@ -501,8 +522,28 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			attemptStart := time.Now()
 			chunks, err := executeFunc(ctx, auth, target.Model)
 			if err != nil {
-				// Connection failed, try next target
-				attemptLatency := time.Since(attemptStart).Milliseconds()
+				// Classify the connection error
+				errClass := ClassifyError(err)
+
+				if errClass == ErrorClassNonRetryable {
+					// Request-level problem — return immediately without cooldown
+					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
+						Failed(err.Error())
+					e.metrics.RecordEvent(&RoutingEvent{
+						Type:    EventNonRetryableError,
+						RouteID: decision.RouteID,
+						Details: map[string]any{
+							"error":       err.Error(),
+							"error_class": errClass.String(),
+						},
+					})
+					log.Debugf("[UnifiedRouting] Stream: non-retryable error, returning immediately: %v", err)
+					trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
+					e.metrics.RecordRequest(trace)
+					return nil, err
+				}
+
+				// Retryable — cooldown and try next target
 				e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed(err.Error())
@@ -514,7 +555,8 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					Details: map[string]any{
 						"duration_seconds": int(cooldownDuration.Seconds()),
 						"reason":           err.Error(),
-						"latency_ms":       attemptLatency,
+						"error_class":      errClass.String(),
+						"latency_ms":       time.Since(attemptStart).Milliseconds(),
 					},
 				})
 				continue
@@ -576,9 +618,36 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			}
 
 			if firstChunk.Err != nil {
-				// First chunk has error - try next target
-				attemptLatency := time.Since(attemptStart).Milliseconds()
+				// Classify the first-chunk error
+				chunkErrClass := ClassifyError(firstChunk.Err)
 				errMsg := firstChunk.Err.Error()
+
+				// Drain remaining chunks to prevent goroutine leak
+				go func() {
+					for range chunks {
+					}
+				}()
+
+				if chunkErrClass == ErrorClassNonRetryable {
+					// Request-level problem — return immediately without cooldown
+					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
+						Failed(errMsg)
+					e.metrics.RecordEvent(&RoutingEvent{
+						Type:    EventNonRetryableError,
+						RouteID: decision.RouteID,
+						Details: map[string]any{
+							"error":       errMsg,
+							"error_class": chunkErrClass.String(),
+						},
+					})
+					log.Debugf("[UnifiedRouting] Stream first chunk: non-retryable error, returning immediately: %v", firstChunk.Err)
+					trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
+					e.metrics.RecordRequest(trace)
+					return nil, firstChunk.Err
+				}
+
+				// Retryable — cooldown and try next target
+				attemptLatency := time.Since(attemptStart).Milliseconds()
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed(errMsg)
@@ -590,14 +659,10 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					Details: map[string]any{
 						"duration_seconds": int(cooldownDuration.Seconds()),
 						"reason":           errMsg,
+						"error_class":      chunkErrClass.String(),
 						"latency_ms":       attemptLatency,
 					},
 				})
-				// Drain remaining chunks to prevent goroutine leak
-				go func() {
-					for range chunks {
-					}
-				}()
 				continue
 			}
 
