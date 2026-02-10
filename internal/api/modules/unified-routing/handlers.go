@@ -165,6 +165,7 @@ func (h *Handlers) GetRoute(c *gin.Context) {
 func (h *Handlers) CreateRoute(c *gin.Context) {
 	var req struct {
 		Name        string   `json:"name" binding:"required"`
+		Aliases     []string `json:"aliases"`
 		Description string   `json:"description"`
 		Enabled     bool     `json:"enabled"`
 		Pipeline    Pipeline `json:"pipeline"`
@@ -178,6 +179,7 @@ func (h *Handlers) CreateRoute(c *gin.Context) {
 	// Validate
 	route := &Route{
 		Name:        req.Name,
+		Aliases:     req.Aliases,
 		Description: req.Description,
 		Enabled:     req.Enabled,
 	}
@@ -220,6 +222,7 @@ func (h *Handlers) UpdateRoute(c *gin.Context) {
 
 	var req struct {
 		Name        string   `json:"name" binding:"required"`
+		Aliases     []string `json:"aliases"`
 		Description string   `json:"description"`
 		Enabled     bool     `json:"enabled"`
 		Pipeline    Pipeline `json:"pipeline"`
@@ -233,6 +236,7 @@ func (h *Handlers) UpdateRoute(c *gin.Context) {
 	route := &Route{
 		ID:          routeID,
 		Name:        req.Name,
+		Aliases:     req.Aliases,
 		Description: req.Description,
 		Enabled:     req.Enabled,
 	}

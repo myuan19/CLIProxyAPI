@@ -120,15 +120,16 @@ func (s *DefaultConfigService) CreateRoute(ctx context.Context, route *Route) er
 		return fmt.Errorf("route name is required")
 	}
 
-	// Check for duplicate name
+	// Deduplicate and clean aliases (remove empty, remove duplicates with name)
+	route.Aliases = cleanAliases(route.Name, route.Aliases)
+
+	// Check for duplicate name/aliases across existing routes
 	routes, err := s.store.ListRoutes(ctx)
 	if err != nil {
 		return err
 	}
-	for _, r := range routes {
-		if strings.EqualFold(r.Name, route.Name) {
-			return fmt.Errorf("route with name '%s' already exists", route.Name)
-		}
+	if err := checkNameConflicts(route, routes); err != nil {
+		return err
 	}
 
 	route.CreatedAt = time.Now()
@@ -153,17 +154,16 @@ func (s *DefaultConfigService) UpdateRoute(ctx context.Context, route *Route) er
 		return err
 	}
 
-	// Check for duplicate name if name changed
-	if !strings.EqualFold(existing.Name, route.Name) {
-		routes, err := s.store.ListRoutes(ctx)
-		if err != nil {
-			return err
-		}
-		for _, r := range routes {
-			if r.ID != route.ID && strings.EqualFold(r.Name, route.Name) {
-				return fmt.Errorf("route with name '%s' already exists", route.Name)
-			}
-		}
+	// Deduplicate and clean aliases
+	route.Aliases = cleanAliases(route.Name, route.Aliases)
+
+	// Check for duplicate name/aliases across existing routes (exclude self)
+	routes, err := s.store.ListRoutes(ctx)
+	if err != nil {
+		return err
+	}
+	if err := checkNameConflicts(route, routes); err != nil {
+		return err
 	}
 
 	route.CreatedAt = existing.CreatedAt
@@ -342,6 +342,25 @@ func (s *DefaultConfigService) Validate(ctx context.Context, route *Route, pipel
 		if !isValidModelName(route.Name) {
 			errors = append(errors, ValidationError{Field: "name", Message: "route name must be alphanumeric with dashes/underscores"})
 		}
+
+		// Validate aliases
+		seen := map[string]bool{strings.ToLower(route.Name): true}
+		for i, alias := range route.Aliases {
+			lower := strings.ToLower(alias)
+			if alias == "" {
+				continue // skip empty aliases
+			}
+			if len(alias) > 64 {
+				errors = append(errors, ValidationError{Field: fmt.Sprintf("aliases[%d]", i), Message: "alias must be 64 characters or less"})
+			}
+			if !isValidModelName(alias) {
+				errors = append(errors, ValidationError{Field: fmt.Sprintf("aliases[%d]", i), Message: fmt.Sprintf("alias '%s' must be alphanumeric with dashes/underscores/dots", alias)})
+			}
+			if seen[lower] {
+				errors = append(errors, ValidationError{Field: fmt.Sprintf("aliases[%d]", i), Message: fmt.Sprintf("duplicate alias '%s'", alias)})
+			}
+			seen[lower] = true
+		}
 	}
 
 	// Validate pipeline
@@ -430,6 +449,57 @@ func (s *DefaultConfigService) notify(event ConfigChangeEvent) {
 func generateShortID() string {
 	id := uuid.New().String()
 	return id[:8]
+}
+
+// cleanAliases deduplicates and filters aliases, removing empty strings
+// and any alias that matches the route name (case-insensitive).
+func cleanAliases(name string, aliases []string) []string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	seen := map[string]bool{strings.ToLower(name): true}
+	var result []string
+	for _, a := range aliases {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		lower := strings.ToLower(a)
+		if seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		result = append(result, a)
+	}
+	return result
+}
+
+// checkNameConflicts checks that the route's name and aliases don't conflict
+// with any other route's name or aliases. Skips routes with the same ID (for updates).
+func checkNameConflicts(route *Route, allRoutes []*Route) error {
+	// Collect all names from the new/updated route
+	newNames := make(map[string]string) // lowercase -> original
+	newNames[strings.ToLower(route.Name)] = route.Name
+	for _, a := range route.Aliases {
+		newNames[strings.ToLower(a)] = a
+	}
+
+	for _, r := range allRoutes {
+		if r.ID == route.ID {
+			continue
+		}
+		// Check against existing route's name
+		if original, ok := newNames[strings.ToLower(r.Name)]; ok {
+			return fmt.Errorf("name/alias '%s' conflicts with route '%s'", original, r.Name)
+		}
+		// Check against existing route's aliases
+		for _, a := range r.Aliases {
+			if original, ok := newNames[strings.ToLower(a)]; ok {
+				return fmt.Errorf("name/alias '%s' conflicts with alias '%s' on route '%s'", original, a, r.Name)
+			}
+		}
+	}
+	return nil
 }
 
 func isValidModelName(name string) bool {

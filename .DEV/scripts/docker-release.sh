@@ -457,9 +457,16 @@ run_main() {
             write_success "前端依赖已存在"
         fi
 
+        # 清除旧构建产物，避免构建失败时误用旧文件
+        rm -rf dist
+
         # 构建前端
         write_command "npm run build" "构建前端项目"
-        npm run build
+        if ! npm run build; then
+            popd > /dev/null
+            echo -e "${RED}✗ 前端构建失败，请检查上方错误信息${NC}"
+            return 1
+        fi
 
         # 检查构建输出
         if [ ! -f "$FRONTEND_DIST_HTML" ]; then
@@ -771,6 +778,7 @@ EOF
         echo ""
         echo -e "${CYAN}可用命令（在新终端中执行）:${NC}"
         echo -e "  ${GRAY}浏览器访问: ${GREEN}http://localhost:$container_port/management.html${NC}"
+        echo -e "  ${GRAY}请求详情:   ${GREEN}http://localhost:$container_port/management.html#/detailed-requests${NC}"
         echo -e "  ${GRAY}查看日志:   ${CYAN}docker logs -f $TEST_CONTAINER_NAME${NC}"
         echo -e "  ${GRAY}进入容器:   ${CYAN}docker exec -it $TEST_CONTAINER_NAME sh${NC}"
         echo -e "  ${GRAY}API 测试:   ${CYAN}curl http://localhost:$container_port/v1/models -H \"Authorization: Bearer $api_key_for_health_check\"${NC}"

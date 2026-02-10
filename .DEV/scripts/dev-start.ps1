@@ -217,6 +217,8 @@ Write-Host "  启动后端服务..." -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "前端管理界面: http://localhost:$BackendPort/management.html" -ForegroundColor Green
+Write-Host "  请求详情:   http://localhost:$BackendPort/management.html#/detailed-requests" -ForegroundColor Green
+Write-Host ""
 Write-Host "按 Ctrl+C 停止服务" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "提示: 如果健康检查按钮没有出现，请检查:" -ForegroundColor Yellow

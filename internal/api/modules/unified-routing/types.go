@@ -36,10 +36,19 @@ func DefaultHealthCheckConfig() HealthCheckConfig {
 type Route struct {
 	ID          string    `json:"id" yaml:"id"`
 	Name        string    `json:"name" yaml:"name"`
+	Aliases     []string  `json:"aliases,omitempty" yaml:"aliases,omitempty"`
 	Description string    `json:"description,omitempty" yaml:"description,omitempty"`
 	Enabled     bool      `json:"enabled" yaml:"enabled"`
 	CreatedAt   time.Time `json:"created_at" yaml:"-"`
 	UpdatedAt   time.Time `json:"updated_at" yaml:"-"`
+}
+
+// AllNames returns the route name followed by all aliases.
+func (r *Route) AllNames() []string {
+	names := make([]string, 0, 1+len(r.Aliases))
+	names = append(names, r.Name)
+	names = append(names, r.Aliases...)
+	return names
 }
 
 // Pipeline represents the routing pipeline configuration (value object).

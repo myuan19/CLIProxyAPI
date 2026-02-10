@@ -77,6 +77,8 @@ echo "  启动后端服务..."
 echo "========================================"
 echo ""
 echo "前端管理界面: http://localhost:8317/management.html"
+echo "  请求详情: http://localhost:8317/management.html#/detailed-requests"
+echo ""
 echo "按 Ctrl+C 停止服务"
 echo ""
 

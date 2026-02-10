@@ -485,11 +485,14 @@ try {
                 Write-Success "前端依赖已存在"
             }
             
+            # 清除旧构建产物，避免构建失败时误用旧文件
+            if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
+
             # 构建前端
             Write-Command "npm run build" "构建前端项目"
             npm run build
             if ($LASTEXITCODE -ne 0) {
-                throw "前端构建失败"
+                throw "前端构建失败，请检查上方错误信息"
             }
             
             # 检查构建输出
@@ -792,6 +795,8 @@ debug: true
         Write-Host "可用命令（在新终端中执行）:" -ForegroundColor Cyan
         Write-Host "  浏览器访问: " -NoNewline -ForegroundColor Gray
         Write-Host "http://localhost:$TestPort/management.html" -ForegroundColor Green
+        Write-Host "  请求详情:   " -NoNewline -ForegroundColor Gray
+        Write-Host "http://localhost:$TestPort/management.html#/detailed-requests" -ForegroundColor Green
         Write-Host "  查看日志:   " -NoNewline -ForegroundColor Gray
         Write-Host "docker logs -f $TestContainerName" -ForegroundColor Cyan
         Write-Host "  进入容器:   " -NoNewline -ForegroundColor Gray
