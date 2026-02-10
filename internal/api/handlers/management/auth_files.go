@@ -408,6 +408,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.LastRefreshedAt.IsZero() {
 		entry["last_refresh"] = auth.LastRefreshedAt
 	}
+	if auth.ProxyURL != "" {
+		entry["proxy_url"] = auth.ProxyURL
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
@@ -2466,9 +2469,12 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 		overallStatus = "partial"
 	}
 
+	proxyUsed := h.authManager.ProxyUsedForAuth(targetAuth)
+
 	c.JSON(http.StatusOK, gin.H{
 		"auth_id":        targetAuth.ID,
 		"status":         overallStatus,
+		"proxy_used":     proxyUsed,
 		"healthy_count":  healthyCount,
 		"unhealthy_count": unhealthyCount,
 		"total_count":    len(results),
@@ -2502,6 +2508,9 @@ func (h *Handler) checkAuthFileModelsHealthStream(c *gin.Context, targetAuth *co
 		c.SSEvent(event, data)
 		flusher.Flush()
 	}
+
+	proxyUsed := h.authManager.ProxyUsedForAuth(targetAuth)
+	sendEvent("meta", gin.H{"auth_id": targetAuth.ID, "proxy_used": proxyUsed})
 
 	runOne := func(model *registry.ModelInfo) {
 		startTime := time.Now()
