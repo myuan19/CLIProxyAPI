@@ -205,19 +205,8 @@ func (s *DefaultConfigService) UpdatePipeline(ctx context.Context, routeID strin
 		return fmt.Errorf("pipeline validation failed: %s", errs[0].Message)
 	}
 
-	// Normalise layer defaults – fill zero cooldown with the configured default
-	// so the stored value always reflects the effective setting.
-	healthCfg, _ := s.store.LoadHealthCheckConfig(ctx)
-	defaultCooldown := DefaultHealthCheckConfig().DefaultCooldownSeconds
-	if healthCfg != nil && healthCfg.DefaultCooldownSeconds > 0 {
-		defaultCooldown = healthCfg.DefaultCooldownSeconds
-	}
-
 	// Ensure target IDs are set
 	for i := range pipeline.Layers {
-		if pipeline.Layers[i].CooldownSeconds <= 0 {
-			pipeline.Layers[i].CooldownSeconds = defaultCooldown
-		}
 		for j := range pipeline.Layers[i].Targets {
 			if pipeline.Layers[i].Targets[j].ID == "" {
 				pipeline.Layers[i].Targets[j].ID = "target-" + generateShortID()

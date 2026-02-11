@@ -406,7 +406,7 @@ func (s *FileMetricsStore) RecordTrace(ctx context.Context, trace *RequestTrace)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := json.Marshal(trace)
+	data, err := json.MarshalIndent(trace, "", "    ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal trace: %w", err)
 	}

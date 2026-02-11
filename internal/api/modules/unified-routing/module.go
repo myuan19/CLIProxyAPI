@@ -1,6 +1,7 @@
 package unifiedrouting
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -25,12 +26,13 @@ type Module struct {
 	stateStore   StateStore
 	metricsStore MetricsStore
 
-	configSvc     ConfigService
-	stateMgr      StateManager
-	metrics       MetricsCollector
-	healthChecker HealthChecker
-	engine        RoutingEngine
-	handlers      *Handlers
+		configSvc        ConfigService
+		stateMgr         StateManager
+		metrics          MetricsCollector
+		routeActivity    *RouteActivityTracker
+		healthChecker    HealthChecker
+		engine           RoutingEngine
+		handlers         *Handlers
 
 	initOnce       sync.Once
 	routesOnce     sync.Once
@@ -99,6 +101,11 @@ func (m *Module) Register(ctx modules.Context) error {
 		log.Info("[UnifiedRouting] Skipping auto route registration (will be registered later)")
 	}
 
+	// Start background health checker for timed-cooling targets
+	if err := m.Start(); err != nil {
+		log.Errorf("[UnifiedRouting] Failed to start health checker: %v", err)
+	}
+
 	log.Info("[UnifiedRouting] Module registered successfully")
 	return nil
 }
@@ -150,8 +157,9 @@ func (m *Module) init(ctx modules.Context) error {
 		m.configSvc = NewConfigService(m.configStore)
 		m.stateMgr = NewStateManager(m.stateStore, m.configSvc)
 		m.metrics = NewMetricsCollector(m.metricsStore)
-		m.healthChecker = NewHealthChecker(m.configSvc, m.stateMgr, m.metrics, m.authManager)
-		m.engine = NewRoutingEngine(m.configSvc, m.stateMgr, m.metrics, m.authManager)
+		m.routeActivity = NewRouteActivityTracker()
+		m.healthChecker = NewHealthChecker(m.configSvc, m.stateMgr, m.metrics, m.authManager, m.routeActivity)
+		m.engine = NewRoutingEngine(m.configSvc, m.stateMgr, m.metrics, m.authManager, m.routeActivity, m.healthChecker)
 
 		// Initialize handlers
 		m.handlers = NewHandlers(m.configSvc, m.stateMgr, m.metrics, m.healthChecker, m.authManager, m.engine)
@@ -282,15 +290,11 @@ func (m *Module) GetHealthChecker() HealthChecker {
 	return m.healthChecker
 }
 
-// Start starts background tasks.
-// Note: Background health checks are disabled by design.
-// Cooldown expiration is handled automatically when a target is selected.
-// Manual health checks can still be triggered via the API.
+// Start starts background tasks (periodic health checks for timed-cooling targets).
 func (m *Module) Start() error {
-	// Background health checker is intentionally NOT started.
-	// Targets automatically become available again when their cooldown expires
-	// (checked in GetTargetState and SelectTarget).
-	// Manual health checks can still be triggered via POST /health/check endpoints.
+	if m.healthChecker != nil {
+		return m.healthChecker.Start(context.Background())
+	}
 	return nil
 }
 

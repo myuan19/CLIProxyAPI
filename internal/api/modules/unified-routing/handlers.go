@@ -446,27 +446,18 @@ func (h *Handlers) ResetTarget(c *gin.Context) {
 	})
 }
 
-// ForceCooldown forces a target into cooldown.
+// ForceCooldown forces a target into untimed cooldown (recovery only when health check passes).
 func (h *Handlers) ForceCooldown(c *gin.Context) {
 	targetID := c.Param("target_id")
 
-	var req struct {
-		DurationSeconds int `json:"duration_seconds"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		req.DurationSeconds = 60
-	}
-
-	duration := time.Duration(req.DurationSeconds) * time.Second
-	if err := h.stateMgr.ForceCooldown(c.Request.Context(), targetID, duration); err != nil {
+	if err := h.stateMgr.ForceCooldown(c.Request.Context(), targetID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":          "cooldown started",
-		"target_id":        targetID,
-		"duration_seconds": req.DurationSeconds,
+		"message":   "cooldown started",
+		"target_id": targetID,
 	})
 }
 
@@ -1004,13 +995,6 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 		return
 	}
 	
-	// Get health check config for cooldown duration
-	healthConfig, _ := h.configSvc.GetHealthCheckConfig(ctx)
-	if healthConfig == nil {
-		cfg := DefaultHealthCheckConfig()
-		healthConfig = &cfg
-	}
-	
 	response := SimulateRouteResponse{
 		RouteID:   routeID,
 		RouteName: route.Name,
@@ -1025,12 +1009,6 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 		layerResult := SimulateLayerResult{
 			Layer:   layer.Level,
 			Targets: make([]SimulateTargetResult, 0),
-		}
-		
-		// Calculate cooldown duration for this layer
-		cooldownDuration := time.Duration(layer.CooldownSeconds) * time.Second
-		if cooldownDuration == 0 {
-			cooldownDuration = time.Duration(healthConfig.DefaultCooldownSeconds) * time.Second
 		}
 		
 		// Keep trying targets in this layer until no available targets remain
@@ -1086,15 +1064,15 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 					Failed(errMsg)
 				
 				// Start cooldown immediately on failure (CheckTarget doesn't do this)
-				h.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				h.stateMgr.StartCooldownTimed(ctx, target.ID)
+				h.healthChecker.ScheduleTargetCheck(target.ID)
 				h.metrics.RecordEvent(&RoutingEvent{
 					Type:     EventCooldownStarted,
 					RouteID:  routeID,
 					TargetID: target.ID,
 					Details: map[string]any{
-						"duration_seconds": int(cooldownDuration.Seconds()),
-						"reason":           errMsg,
-						"source":           "simulate",
+						"reason": errMsg,
+						"source": "simulate",
 					},
 				})
 				

@@ -19,10 +19,23 @@ import (
 )
 
 const (
+	// 请求日志（RequestLog）使用的 Gin 键
 	apiAttemptsKey = "API_UPSTREAM_ATTEMPTS"
 	apiRequestKey  = "API_REQUEST"
 	apiResponseKey = "API_RESPONSE"
+
+	// 详细日志（DetailedRequestLog）专用 Gin 键，与请求日志完全解耦
+	detailedLogAttemptsKey = "DETAILED_LOG_API_ATTEMPTS"
+	detailedLogRequestKey  = "DETAILED_LOG_API_REQUEST"
+	detailedLogResponseKey = "DETAILED_LOG_API_RESPONSE"
 )
+
+// attemptKeys 表示一组 Gin 键，用于某一类消费者（请求日志 or 详细日志）
+type attemptKeys struct {
+	attempts string
+	request  string
+	response string
+}
 
 // upstreamRequestLog captures the outbound upstream request details for logging.
 type upstreamRequestLog struct {
@@ -49,17 +62,34 @@ type upstreamAttempt struct {
 	errorWritten         bool
 }
 
-// recordAPIRequest stores the upstream request metadata in Gin context for request logging.
+// shouldRecordAttemptsForDetailedLog returns true when detailed request log is enabled.
+// Detailed log is independent of RequestLog: attempts are recorded for it when this is true.
+func shouldRecordAttemptsForDetailedLog(cfg *config.Config) bool {
+	return cfg != nil && cfg.DetailedRequestLog
+}
+
+// shouldRecordAttemptsForRequestLog returns true when the generic request log is enabled.
+func shouldRecordAttemptsForRequestLog(cfg *config.Config) bool {
+	return cfg != nil && cfg.RequestLog
+}
+
+// recordAPIRequest stores the upstream request metadata in Gin context.
+// 完全解耦：详细日志与请求日志使用独立 Gin 键，各自根据开关写入。
 func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequestLog) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
 	}
+	if shouldRecordAttemptsForDetailedLog(cfg) {
+		recordAPIRequestForKeys(ginCtx, &attemptKeys{detailedLogAttemptsKey, detailedLogRequestKey, detailedLogResponseKey}, info)
+	}
+	if shouldRecordAttemptsForRequestLog(cfg) {
+		recordAPIRequestForKeys(ginCtx, &attemptKeys{apiAttemptsKey, apiRequestKey, apiResponseKey}, info)
+	}
+}
 
-	attempts := getAttempts(ginCtx)
+func recordAPIRequestForKeys(ginCtx *gin.Context, keys *attemptKeys, info upstreamRequestLog) {
+	attempts := getAttemptsForKey(ginCtx, keys.attempts)
 	index := len(attempts) + 1
 
 	builder := &strings.Builder{}
@@ -92,20 +122,26 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 		response: &strings.Builder{},
 	}
 	attempts = append(attempts, attempt)
-	ginCtx.Set(apiAttemptsKey, attempts)
-	updateAggregatedRequest(ginCtx, attempts)
+	ginCtx.Set(keys.attempts, attempts)
+	updateAggregatedRequestForKey(ginCtx, attempts, keys.request)
 }
 
 // recordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
 	}
-	attempts, attempt := ensureAttempt(ginCtx)
+	if shouldRecordAttemptsForDetailedLog(cfg) {
+		recordAPIResponseMetadataForKeys(ginCtx, &attemptKeys{detailedLogAttemptsKey, detailedLogRequestKey, detailedLogResponseKey}, status, headers)
+	}
+	if shouldRecordAttemptsForRequestLog(cfg) {
+		recordAPIResponseMetadataForKeys(ginCtx, &attemptKeys{apiAttemptsKey, apiRequestKey, apiResponseKey}, status, headers)
+	}
+}
+
+func recordAPIResponseMetadataForKeys(ginCtx *gin.Context, keys *attemptKeys, status int, headers http.Header) {
+	attempts, attempt := ensureAttemptForKey(ginCtx, keys)
 	ensureResponseIntro(attempt)
 
 	if status > 0 && !attempt.statusWritten {
@@ -119,23 +155,31 @@ func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 		attempt.response.WriteString("\n")
 	}
 
-	updateAggregatedResponse(ginCtx, attempts)
+	updateAggregatedResponseForKey(ginCtx, attempts, keys.response)
 }
 
 // recordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if err == nil {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
 	}
-	attempts, attempt := ensureAttempt(ginCtx)
+	if shouldRecordAttemptsForDetailedLog(cfg) {
+		recordAPIResponseErrorForKeys(ginCtx, &attemptKeys{detailedLogAttemptsKey, detailedLogRequestKey, detailedLogResponseKey}, err)
+	}
+	if shouldRecordAttemptsForRequestLog(cfg) {
+		recordAPIResponseErrorForKeys(ginCtx, &attemptKeys{apiAttemptsKey, apiRequestKey, apiResponseKey}, err)
+	}
+}
+
+func recordAPIResponseErrorForKeys(ginCtx *gin.Context, keys *attemptKeys, err error) {
+	attempts, attempt := ensureAttemptForKey(ginCtx, keys)
 	ensureResponseIntro(attempt)
 
 	if attempt.bodyStarted && !attempt.bodyHasContent {
-		// Ensure body does not stay empty marker if error arrives first.
 		attempt.bodyStarted = false
 	}
 	if attempt.errorWritten {
@@ -144,14 +188,11 @@ func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
 	attempt.errorWritten = true
 
-	updateAggregatedResponse(ginCtx, attempts)
+	updateAggregatedResponseForKey(ginCtx, attempts, keys.response)
 }
 
-// appendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
+// appendAPIResponseChunk appends an upstream response chunk to Gin context.
 func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
@@ -160,7 +201,16 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	if ginCtx == nil {
 		return
 	}
-	attempts, attempt := ensureAttempt(ginCtx)
+	if shouldRecordAttemptsForDetailedLog(cfg) {
+		appendAPIResponseChunkForKeys(ginCtx, &attemptKeys{detailedLogAttemptsKey, detailedLogRequestKey, detailedLogResponseKey}, data)
+	}
+	if shouldRecordAttemptsForRequestLog(cfg) {
+		appendAPIResponseChunkForKeys(ginCtx, &attemptKeys{apiAttemptsKey, apiRequestKey, apiResponseKey}, data)
+	}
+}
+
+func appendAPIResponseChunkForKeys(ginCtx *gin.Context, keys *attemptKeys, data []byte) {
+	attempts, attempt := ensureAttemptForKey(ginCtx, keys)
 	ensureResponseIntro(attempt)
 
 	if !attempt.headersWritten {
@@ -179,7 +229,7 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	attempt.response.WriteString(string(data))
 	attempt.bodyHasContent = true
 
-	updateAggregatedResponse(ginCtx, attempts)
+	updateAggregatedResponseForKey(ginCtx, attempts, keys.response)
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {
@@ -187,11 +237,11 @@ func ginContextFrom(ctx context.Context) *gin.Context {
 	return ginCtx
 }
 
-func getAttempts(ginCtx *gin.Context) []*upstreamAttempt {
+func getAttemptsForKey(ginCtx *gin.Context, attemptsKey string) []*upstreamAttempt {
 	if ginCtx == nil {
 		return nil
 	}
-	if value, exists := ginCtx.Get(apiAttemptsKey); exists {
+	if value, exists := ginCtx.Get(attemptsKey); exists {
 		if attempts, ok := value.([]*upstreamAttempt); ok {
 			return attempts
 		}
@@ -199,8 +249,8 @@ func getAttempts(ginCtx *gin.Context) []*upstreamAttempt {
 	return nil
 }
 
-func ensureAttempt(ginCtx *gin.Context) ([]*upstreamAttempt, *upstreamAttempt) {
-	attempts := getAttempts(ginCtx)
+func ensureAttemptForKey(ginCtx *gin.Context, keys *attemptKeys) ([]*upstreamAttempt, *upstreamAttempt) {
+	attempts := getAttemptsForKey(ginCtx, keys.attempts)
 	if len(attempts) == 0 {
 		attempt := &upstreamAttempt{
 			index:    1,
@@ -208,8 +258,8 @@ func ensureAttempt(ginCtx *gin.Context) ([]*upstreamAttempt, *upstreamAttempt) {
 			response: &strings.Builder{},
 		}
 		attempts = []*upstreamAttempt{attempt}
-		ginCtx.Set(apiAttemptsKey, attempts)
-		updateAggregatedRequest(ginCtx, attempts)
+		ginCtx.Set(keys.attempts, attempts)
+		updateAggregatedRequestForKey(ginCtx, attempts, keys.request)
 	}
 	return attempts, attempts[len(attempts)-1]
 }
@@ -224,7 +274,7 @@ func ensureResponseIntro(attempt *upstreamAttempt) {
 	attempt.responseIntroWritten = true
 }
 
-func updateAggregatedRequest(ginCtx *gin.Context, attempts []*upstreamAttempt) {
+func updateAggregatedRequestForKey(ginCtx *gin.Context, attempts []*upstreamAttempt, requestKey string) {
 	if ginCtx == nil {
 		return
 	}
@@ -232,10 +282,10 @@ func updateAggregatedRequest(ginCtx *gin.Context, attempts []*upstreamAttempt) {
 	for _, attempt := range attempts {
 		builder.WriteString(attempt.request)
 	}
-	ginCtx.Set(apiRequestKey, []byte(builder.String()))
+	ginCtx.Set(requestKey, []byte(builder.String()))
 }
 
-func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) {
+func updateAggregatedResponseForKey(ginCtx *gin.Context, attempts []*upstreamAttempt, responseKey string) {
 	if ginCtx == nil {
 		return
 	}
@@ -256,7 +306,7 @@ func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) 
 			builder.WriteString("\n")
 		}
 	}
-	ginCtx.Set(apiResponseKey, []byte(builder.String()))
+	ginCtx.Set(responseKey, []byte(builder.String()))
 }
 
 func writeHeaders(builder *strings.Builder, headers http.Header) {

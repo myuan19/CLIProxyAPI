@@ -1,6 +1,8 @@
 // Package middleware provides HTTP middleware components for the CLI Proxy API server.
-// This file contains the detailed request logging middleware that captures comprehensive
-// structured request and response data for browsing via the management panel.
+// This file implements the detailed request logging middleware: it records each request's
+// client request, final response, and the retry part (upstream attempts). The retry part
+// is filled from Gin context (API_REQUEST/API_RESPONSE), which the executor writes when
+// DetailedRequestLog is enabled—no dependency on RequestLog.
 package middleware
 
 import (
@@ -121,7 +123,7 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 			record.ResponseBody = truncateString(detailedCapture.body.String(), 50000)
 		}
 
-		// Extract upstream attempts from context
+		// 重试部分：从 Gin 上下文中记录各次上游请求/响应（由 executor 在 DetailedRequestLog 开启时写入）
 		record.Attempts = extractAttempts(c)
 
 		// Extract errors
@@ -209,11 +211,17 @@ type nopCloser struct {
 
 func (nopCloser) Close() error { return nil }
 
-// extractAttempts extracts upstream attempt data from the Gin context.
-// It parses the API_REQUEST and API_RESPONSE aggregated data to build attempt records.
+// 详细日志专用 Gin 键，与请求日志（API_REQUEST/API_RESPONSE）完全解耦
+const (
+	detailedLogAPIRequestKey  = "DETAILED_LOG_API_REQUEST"
+	detailedLogAPIResponseKey = "DETAILED_LOG_API_RESPONSE"
+)
+
+// extractAttempts 记录重试部分：从 Gin 读取详细日志专用键（仅当开启详细日志时由 executor 写入）
+// 与请求日志的 API_REQUEST/API_RESPONSE 无关。
 func extractAttempts(c *gin.Context) []logging.DetailedAttempt {
-	apiRequestRaw, hasReq := c.Get("API_REQUEST")
-	apiResponseRaw, hasResp := c.Get("API_RESPONSE")
+	apiRequestRaw, hasReq := c.Get(detailedLogAPIRequestKey)
+	apiResponseRaw, hasResp := c.Get(detailedLogAPIResponseKey)
 
 	if !hasReq && !hasResp {
 		return nil
@@ -237,14 +245,16 @@ func extractAttempts(c *gin.Context) []logging.DetailedAttempt {
 	result := make([]logging.DetailedAttempt, 0, len(attempts))
 	for _, a := range attempts {
 		result = append(result, logging.DetailedAttempt{
-			Index:       a.Index,
-			UpstreamURL: a.UpstreamURL,
-			Method:      a.Method,
-			Auth:        a.Auth,
-			RequestBody: truncateString(a.RequestBody, 30000),
-			StatusCode:  a.StatusCode,
-			ResponseBody: truncateString(a.ResponseBody, 30000),
-			Error:       a.Error,
+			Index:           a.Index,
+			UpstreamURL:     a.UpstreamURL,
+			Method:          a.Method,
+			Auth:            a.Auth,
+			RequestHeaders:  a.RequestHeaders,
+			RequestBody:     truncateString(a.RequestBody, 30000),
+			StatusCode:      a.StatusCode,
+			ResponseHeaders: a.ResponseHeaders,
+			ResponseBody:    truncateString(a.ResponseBody, 30000),
+			Error:           a.Error,
 		})
 	}
 
@@ -253,14 +263,16 @@ func extractAttempts(c *gin.Context) []logging.DetailedAttempt {
 
 // DetailedAttemptFromContext is a temporary struct for parsing attempt data from context.
 type DetailedAttemptFromContext struct {
-	Index        int
-	UpstreamURL  string
-	Method       string
-	Auth         string
-	RequestBody  string
-	StatusCode   int
-	ResponseBody string
-	Error        string
+	Index           int
+	UpstreamURL     string
+	Method          string
+	Auth            string
+	RequestHeaders  map[string][]string
+	RequestBody     string
+	StatusCode      int
+	ResponseHeaders map[string][]string
+	ResponseBody    string
+	Error           string
 }
 
 // parseAttemptRequests parses the aggregated API_REQUEST data into attempt records.
@@ -299,6 +311,17 @@ func parseAttemptRequests(data string) []DetailedAttemptFromContext {
 			}
 		}
 
+		// Extract headers section (between "Headers:\n" and "\nBody:\n")
+		if headersIdx := strings.Index(section, "Headers:\n"); headersIdx >= 0 {
+			headersEnd := strings.Index(section[headersIdx+9:], "\nBody:\n")
+			if headersEnd >= 0 {
+				attempt.RequestHeaders = parseHeaderBlock(section[headersIdx+9 : headersIdx+9+headersEnd])
+			} else {
+				// No Body:\n; take until end of section
+				attempt.RequestHeaders = parseHeaderBlock(section[headersIdx+9:])
+			}
+		}
+
 		// Extract body section
 		if bodyIdx := strings.Index(section, "Body:\n"); bodyIdx >= 0 {
 			body := section[bodyIdx+6:]
@@ -311,6 +334,33 @@ func parseAttemptRequests(data string) []DetailedAttemptFromContext {
 	}
 
 	return attempts
+}
+
+// parseHeaderBlock parses a "Headers:\n" block (key: value lines, one per line; <none> means empty).
+func parseHeaderBlock(block string) map[string][]string {
+	block = strings.TrimSpace(block)
+	if block == "" || block == "<none>" {
+		return nil
+	}
+	out := make(map[string][]string)
+	lines := strings.Split(block, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		idx := strings.Index(line, ": ")
+		if idx <= 0 {
+			continue
+		}
+		key := line[:idx]
+		value := line[idx+2:]
+		out[key] = append(out[key], value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // mergeAttemptResponses merges response data into existing attempt records.
@@ -354,6 +404,20 @@ func mergeAttemptResponses(attempts []DetailedAttemptFromContext, data string) {
 				}
 			} else if strings.HasPrefix(line, "Error: ") {
 				target.Error = strings.TrimPrefix(line, "Error: ")
+			}
+		}
+
+		// Extract response headers (between "Headers:\n" and "\nBody:\n" or "\nError: " or end)
+		if headersIdx := strings.Index(section, "Headers:\n"); headersIdx >= 0 {
+			afterHeaders := section[headersIdx+9:]
+			headersEnd := strings.Index(afterHeaders, "\nBody:\n")
+			if headersEnd < 0 {
+				headersEnd = strings.Index(afterHeaders, "\nError: ")
+			}
+			if headersEnd >= 0 {
+				target.ResponseHeaders = parseHeaderBlock(afterHeaders[:headersEnd])
+			} else {
+				target.ResponseHeaders = parseHeaderBlock(afterHeaders)
 			}
 		}
 

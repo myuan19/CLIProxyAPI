@@ -25,8 +25,9 @@ func (h *Handler) GetDetailedRequestLog(c *gin.Context) {
 	}
 
 	result := gin.H{
-		"detailed-request-log":             enabled,
-		"detailed-request-log-max-size-mb": maxSizeMB,
+		"detailed-request-log":              enabled,
+		"detailed-request-log-max-size-mb":  maxSizeMB,
+		"detailed-request-log-show-retries": h.cfg.DetailedRequestLogShowRetries,
 	}
 
 	// Include stats if logger is available
@@ -42,7 +43,8 @@ func (h *Handler) GetDetailedRequestLog(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// PutDetailedRequestLog enables or disables detailed request logging.
+// PutDetailedRequestLog enables or disables detailed request logging, and/or updates show-retries UI preference.
+// Body may include "value" (bool) for detailed log enabled, "show_retries" (bool) for UI preference; at least one required.
 func (h *Handler) PutDetailedRequestLog(c *gin.Context) {
 	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
@@ -50,18 +52,26 @@ func (h *Handler) PutDetailedRequestLog(c *gin.Context) {
 	}
 
 	var body struct {
-		Value *bool `json:"value"`
+		Value       *bool `json:"value"`
+		ShowRetries *bool `json:"show_retries"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body, expected {\"value\": true/false}"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value == nil && body.ShowRetries == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body, expected {\"value\": true/false} and/or {\"show_retries\": true/false}"})
 		return
 	}
 
-	h.cfg.DetailedRequestLog = *body.Value
-
-	// Update logger state dynamically
-	if h.detailedLogger != nil {
-		h.detailedLogger.SetEnabled(*body.Value)
+	if body.Value != nil {
+		h.cfg.DetailedRequestLog = *body.Value
+		if h.detailedLogger != nil {
+			h.detailedLogger.SetEnabled(*body.Value)
+		}
+	}
+	if body.ShowRetries != nil {
+		h.cfg.DetailedRequestLogShowRetries = *body.ShowRetries
 	}
 
 	h.persist(c)
