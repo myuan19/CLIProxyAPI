@@ -15,20 +15,19 @@ type Settings struct {
 }
 
 // HealthCheckConfig holds the health check configuration.
+// Recovery from cooldown is purely by health check; no cooldown duration is used.
 type HealthCheckConfig struct {
-	DefaultCooldownSeconds   int `json:"default_cooldown_seconds" yaml:"default-cooldown-seconds"`
-	CheckIntervalSeconds     int `json:"check_interval_seconds" yaml:"check-interval-seconds"`
-	CheckTimeoutSeconds      int `json:"check_timeout_seconds" yaml:"check-timeout-seconds"`
-	MaxConsecutiveFailures   int `json:"max_consecutive_failures" yaml:"max-consecutive-failures"`
+	CheckIntervalSeconds   int `json:"check_interval_seconds" yaml:"check-interval-seconds"`
+	CheckTimeoutSeconds    int `json:"check_timeout_seconds" yaml:"check-timeout-seconds"`
+	MaxConsecutiveFailures int `json:"max_consecutive_failures" yaml:"max-consecutive-failures"`
 }
 
 // DefaultHealthCheckConfig returns the default health check configuration.
 func DefaultHealthCheckConfig() HealthCheckConfig {
 	return HealthCheckConfig{
-		DefaultCooldownSeconds:   60,
-		CheckIntervalSeconds:     30,
-		CheckTimeoutSeconds:      10,
-		MaxConsecutiveFailures:   3,
+		CheckIntervalSeconds:   30,
+		CheckTimeoutSeconds:    10,
+		MaxConsecutiveFailures: 3,
 	}
 }
 
@@ -59,10 +58,9 @@ type Pipeline struct {
 
 // Layer represents a layer in the pipeline (value object).
 type Layer struct {
-	Level           int          `json:"level" yaml:"level"`
-	Strategy        LoadStrategy `json:"strategy" yaml:"strategy"`
-	CooldownSeconds int          `json:"cooldown_seconds" yaml:"cooldown-seconds"`
-	Targets         []Target     `json:"targets" yaml:"targets"`
+	Level    int          `json:"level" yaml:"level"`
+	Strategy LoadStrategy `json:"strategy" yaml:"strategy"`
+	Targets  []Target     `json:"targets" yaml:"targets"`
 }
 
 // Target represents a target in a layer (value object).
@@ -88,17 +86,19 @@ const (
 // ================== Runtime State Types ==================
 
 // TargetState represents the runtime state of a target (in-memory entity).
+// When Status is cooling: CooldownEndsAt != nil means timed cooling (next check at this time);
+// CooldownEndsAt == nil means untimed cooling (no periodic check until traffic triggers one).
 type TargetState struct {
-	TargetID            string        `json:"target_id"`
-	Status              TargetStatus  `json:"status"`
-	ConsecutiveFailures int           `json:"consecutive_failures"`
-	CooldownEndsAt      *time.Time    `json:"cooldown_ends_at,omitempty"`
-	LastSuccessAt       *time.Time    `json:"last_success_at,omitempty"`
-	LastFailureAt       *time.Time    `json:"last_failure_at,omitempty"`
-	LastFailureReason   string        `json:"last_failure_reason,omitempty"`
-	ActiveConnections   int64         `json:"active_connections"`
-	TotalRequests       int64         `json:"total_requests"`
-	SuccessfulRequests  int64         `json:"successful_requests"`
+	TargetID            string       `json:"target_id"`
+	Status              TargetStatus `json:"status"`
+	ConsecutiveFailures int          `json:"consecutive_failures"`
+	CooldownEndsAt      *time.Time   `json:"cooldown_ends_at,omitempty"` // next health check due (timed); nil = untimed
+	LastSuccessAt       *time.Time   `json:"last_success_at,omitempty"`
+	LastFailureAt       *time.Time   `json:"last_failure_at,omitempty"`
+	LastFailureReason   string       `json:"last_failure_reason,omitempty"`
+	ActiveConnections   int64        `json:"active_connections"`
+	TotalRequests       int64        `json:"total_requests"`
+	SuccessfulRequests  int64        `json:"successful_requests"`
 }
 
 // TargetStatus defines the status of a target.
@@ -108,8 +108,9 @@ type TargetState struct {
 type TargetStatus string
 
 const (
-	StatusHealthy TargetStatus = "healthy"
-	StatusCooling TargetStatus = "cooling"
+	StatusHealthy  TargetStatus = "healthy"
+	StatusCooling  TargetStatus = "cooling"
+	StatusChecking TargetStatus = "checking"
 )
 
 // RouteState represents the runtime state of a route.

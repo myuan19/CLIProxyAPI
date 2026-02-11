@@ -14,15 +14,18 @@ type StateManager interface {
 	GetTargetState(ctx context.Context, targetID string) (*TargetState, error)
 	ListTargetStates(ctx context.Context) ([]*TargetState, error)
 
-	// State changes (called by engine)
+	// State changes (called by engine and health checker)
 	RecordSuccess(ctx context.Context, targetID string, latency time.Duration)
 	RecordFailure(ctx context.Context, targetID string, reason string)
-	StartCooldown(ctx context.Context, targetID string, duration time.Duration)
+	StartCooldownTimed(ctx context.Context, targetID string)   // next check in CheckIntervalSeconds
+	StartCooldownUntimed(ctx context.Context, targetID string)
+	StartChecking(ctx context.Context, targetID string)        // health check in progress
 	EndCooldown(ctx context.Context, targetID string)
+	SetCooldownNextCheckIn(ctx context.Context, targetID string, d time.Duration) // when cooling or checking
 
 	// Manual operations
 	ResetTarget(ctx context.Context, targetID string) error
-	ForceCooldown(ctx context.Context, targetID string, duration time.Duration) error
+	ForceCooldown(ctx context.Context, targetID string) error
 
 	// Initialize/cleanup
 	InitializeTarget(ctx context.Context, targetID string) error
@@ -125,14 +128,6 @@ func (m *DefaultStateManager) GetRouteState(ctx context.Context, routeID string)
 				}
 			}
 
-			// Check if cooldown has expired
-			if state.Status == StatusCooling && state.CooldownEndsAt != nil {
-				if time.Now().After(*state.CooldownEndsAt) {
-					state.Status = StatusHealthy
-					state.CooldownEndsAt = nil
-				}
-			}
-
 			if state.Status == StatusHealthy {
 				healthyTargets++
 				healthyInLayer++
@@ -169,15 +164,6 @@ func (m *DefaultStateManager) GetTargetState(ctx context.Context, targetID strin
 	state, err := m.store.GetTargetState(ctx, targetID)
 	if err != nil {
 		return nil, err
-	}
-
-	// Check if cooldown has expired
-	if state.Status == StatusCooling && state.CooldownEndsAt != nil {
-		if time.Now().After(*state.CooldownEndsAt) {
-			state.Status = StatusHealthy
-			state.CooldownEndsAt = nil
-			_ = m.store.SetTargetState(ctx, state)
-		}
 	}
 
 	return state, nil
@@ -225,7 +211,7 @@ func (m *DefaultStateManager) RecordFailure(ctx context.Context, targetID string
 	_ = m.store.SetTargetState(ctx, state)
 }
 
-func (m *DefaultStateManager) StartCooldown(ctx context.Context, targetID string, duration time.Duration) {
+func (m *DefaultStateManager) StartCooldownTimed(ctx context.Context, targetID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -234,14 +220,58 @@ func (m *DefaultStateManager) StartCooldown(ctx context.Context, targetID string
 		state = &TargetState{TargetID: targetID}
 	}
 
-	// CooldownEndsAt serves as a safety-net: if the health checker is not
-	// running, GetTargetState will auto-recover the target after this time.
-	// The primary recovery mechanism is the background health checker which
-	// proactively checks all cooling targets on every cycle.
-	cooldownEnd := time.Now().Add(duration)
+	interval := 30 * time.Second
+	if cfg, _ := m.configSvc.GetHealthCheckConfig(ctx); cfg != nil && cfg.CheckIntervalSeconds > 0 {
+		interval = time.Duration(cfg.CheckIntervalSeconds) * time.Second
+	}
+	nextCheck := time.Now().Add(interval)
 	state.Status = StatusCooling
-	state.CooldownEndsAt = &cooldownEnd
+	state.CooldownEndsAt = &nextCheck
 
+	_ = m.store.SetTargetState(ctx, state)
+}
+
+func (m *DefaultStateManager) StartCooldownUntimed(ctx context.Context, targetID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, _ := m.store.GetTargetState(ctx, targetID)
+	if state == nil {
+		state = &TargetState{TargetID: targetID}
+	}
+
+	state.Status = StatusCooling
+	state.CooldownEndsAt = nil
+
+	_ = m.store.SetTargetState(ctx, state)
+}
+
+func (m *DefaultStateManager) StartChecking(ctx context.Context, targetID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, _ := m.store.GetTargetState(ctx, targetID)
+	if state == nil {
+		state = &TargetState{TargetID: targetID}
+	}
+
+	state.Status = StatusChecking
+	state.CooldownEndsAt = nil
+
+	_ = m.store.SetTargetState(ctx, state)
+}
+
+func (m *DefaultStateManager) SetCooldownNextCheckIn(ctx context.Context, targetID string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, _ := m.store.GetTargetState(ctx, targetID)
+	if state == nil || (state.Status != StatusCooling && state.Status != StatusChecking) {
+		return
+	}
+	next := time.Now().Add(d)
+	state.Status = StatusCooling
+	state.CooldownEndsAt = &next
 	_ = m.store.SetTargetState(ctx, state)
 }
 
@@ -274,8 +304,8 @@ func (m *DefaultStateManager) ResetTarget(ctx context.Context, targetID string) 
 	return m.store.SetTargetState(ctx, state)
 }
 
-func (m *DefaultStateManager) ForceCooldown(ctx context.Context, targetID string, duration time.Duration) error {
-	m.StartCooldown(ctx, targetID, duration)
+func (m *DefaultStateManager) ForceCooldown(ctx context.Context, targetID string) error {
+	m.StartCooldownUntimed(ctx, targetID)
 	return nil
 }
 

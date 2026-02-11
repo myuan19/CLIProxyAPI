@@ -50,17 +50,17 @@ type RoutingDecision struct {
 
 // DefaultRoutingEngine implements RoutingEngine.
 type DefaultRoutingEngine struct {
-	configSvc   ConfigService
-	stateMgr    StateManager
-	metrics     MetricsCollector
-	authManager *coreauth.Manager
+	configSvc     ConfigService
+	stateMgr      StateManager
+	metrics       MetricsCollector
+	authManager   *coreauth.Manager
+	routeActivity *RouteActivityTracker
+	healthChecker HealthChecker
 
-	mu          sync.RWMutex
-	routeIndex  map[string]*Route // name -> route
+	mu            sync.RWMutex
+	routeIndex    map[string]*Route    // name -> route
 	pipelineIndex map[string]*Pipeline // routeID -> pipeline
-	
-	// Round-robin state per layer
-	rrCounters map[string]*atomic.Uint64 // layerKey -> counter
+	rrCounters    map[string]*atomic.Uint64
 }
 
 // NewRoutingEngine creates a new routing engine.
@@ -69,12 +69,19 @@ func NewRoutingEngine(
 	stateMgr StateManager,
 	metrics MetricsCollector,
 	authManager *coreauth.Manager,
+	routeActivity *RouteActivityTracker,
+	healthChecker HealthChecker,
 ) *DefaultRoutingEngine {
+	if routeActivity == nil {
+		routeActivity = NewRouteActivityTracker()
+	}
 	engine := &DefaultRoutingEngine{
 		configSvc:     configSvc,
 		stateMgr:      stateMgr,
 		metrics:       metrics,
 		authManager:   authManager,
+		routeActivity: routeActivity,
+		healthChecker: healthChecker,
 		routeIndex:    make(map[string]*Route),
 		pipelineIndex: make(map[string]*Pipeline),
 		rrCounters:    make(map[string]*atomic.Uint64),
@@ -353,23 +360,16 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 		return fmt.Errorf("invalid routing decision")
 	}
 
+	e.routeActivity.Mark(decision.RouteID)
+	if e.healthChecker != nil {
+		go e.healthChecker.TriggerCheckUntimedCoolingTargets(ctx, decision.RouteID)
+	}
+
 	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName)
 	startTime := time.Now()
 
-	// Get health check config for cooldown
-	healthConfig, _ := e.configSvc.GetHealthCheckConfig(ctx)
-	if healthConfig == nil {
-		cfg := DefaultHealthCheckConfig()
-		healthConfig = &cfg
-	}
-
 	// Try each layer in order
 	for layerIdx, layer := range decision.Pipeline.Layers {
-		cooldownDuration := time.Duration(layer.CooldownSeconds) * time.Second
-		if cooldownDuration == 0 {
-			cooldownDuration = time.Duration(healthConfig.DefaultCooldownSeconds) * time.Second
-		}
-
 		// Keep trying targets in this layer until no available targets remain
 		// SelectTarget automatically excludes cooling-down targets
 		for {
@@ -384,8 +384,8 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 			if auth == nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed("credential not found")
-				// Mark as cooldown so we don't keep trying this target
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				continue
 			}
 
@@ -433,15 +433,15 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 			e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
 			traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 				Failed(err.Error())
-			e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+			e.stateMgr.StartCooldownTimed(ctx, target.ID)
+			e.healthChecker.ScheduleTargetCheck(target.ID)
 			e.metrics.RecordEvent(&RoutingEvent{
 				Type:     EventCooldownStarted,
 				RouteID:  decision.RouteID,
 				TargetID: target.ID,
 				Details: map[string]any{
-					"duration_seconds": int(cooldownDuration.Seconds()),
-					"reason":           err.Error(),
-					"error_class":      errClass.String(),
+					"reason":      err.Error(),
+					"error_class": errClass.String(),
 				},
 			})
 
@@ -484,23 +484,16 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 		return nil, fmt.Errorf("invalid routing decision")
 	}
 
+	e.routeActivity.Mark(decision.RouteID)
+	if e.healthChecker != nil {
+		go e.healthChecker.TriggerCheckUntimedCoolingTargets(ctx, decision.RouteID)
+	}
+
 	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName)
 	startTime := time.Now()
 
-	// Get health check config for cooldown
-	healthConfig, _ := e.configSvc.GetHealthCheckConfig(ctx)
-	if healthConfig == nil {
-		cfg := DefaultHealthCheckConfig()
-		healthConfig = &cfg
-	}
-
 	// Try each layer in order
 	for layerIdx, layer := range decision.Pipeline.Layers {
-		cooldownDuration := time.Duration(layer.CooldownSeconds) * time.Second
-		if cooldownDuration == 0 {
-			cooldownDuration = time.Duration(healthConfig.DefaultCooldownSeconds) * time.Second
-		}
-
 		// Keep trying targets in this layer until no available targets remain
 		for {
 			target, err := e.SelectTarget(ctx, decision.RouteID, &layer)
@@ -514,60 +507,116 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			if auth == nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed("credential not found")
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				continue
 			}
 
-			// Try to execute streaming request
+			// Try to execute streaming request.
+			// The single failoverFirstChunkTimeout covers BOTH the connection
+			// establishment AND the wait for the first data chunk.  We run
+			// executeFunc in a goroutine so the timer can fire even when the
+			// upstream is slow to accept the TCP connection.
 			attemptStart := time.Now()
-			chunks, err := executeFunc(ctx, auth, target.Model)
-			if err != nil {
-				// Classify the connection error
-				errClass := ClassifyError(err)
 
-				if errClass == ErrorClassNonRetryable {
-					// Request-level problem — return immediately without cooldown
+			type streamConnResult struct {
+				chunks <-chan cliproxyexecutor.StreamChunk
+				err    error
+			}
+			connCh := make(chan streamConnResult, 1)
+			go func() {
+				c, e := executeFunc(ctx, auth, target.Model)
+				connCh <- streamConnResult{c, e}
+			}()
+
+			firstChunkTimer := time.NewTimer(failoverFirstChunkTimeout)
+
+			// Phase 1: wait for executeFunc to return (connection established).
+			var chunks <-chan cliproxyexecutor.StreamChunk
+			var connTimedOut bool
+			select {
+			case res := <-connCh:
+				if res.err != nil {
+					firstChunkTimer.Stop()
+					// Classify the connection error
+					errClass := ClassifyError(res.err)
+
+					if errClass == ErrorClassNonRetryable {
+						// Request-level problem — return immediately without cooldown
+						traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
+							Failed(res.err.Error())
+						e.metrics.RecordEvent(&RoutingEvent{
+							Type:    EventNonRetryableError,
+							RouteID: decision.RouteID,
+							Details: map[string]any{
+								"error":       res.err.Error(),
+								"error_class": errClass.String(),
+							},
+						})
+						log.Debugf("[UnifiedRouting] Stream: non-retryable error, returning immediately: %v", res.err)
+						trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
+						e.metrics.RecordRequest(trace)
+						return nil, res.err
+					}
+
+					// Retryable — cooldown and try next target
+					e.stateMgr.RecordFailure(ctx, target.ID, res.err.Error())
 					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-						Failed(err.Error())
+						Failed(res.err.Error())
+					e.stateMgr.StartCooldownTimed(ctx, target.ID)
+					e.healthChecker.ScheduleTargetCheck(target.ID)
 					e.metrics.RecordEvent(&RoutingEvent{
-						Type:    EventNonRetryableError,
-						RouteID: decision.RouteID,
+						Type:     EventCooldownStarted,
+						RouteID:  decision.RouteID,
+						TargetID: target.ID,
 						Details: map[string]any{
-							"error":       err.Error(),
+							"reason":      res.err.Error(),
 							"error_class": errClass.String(),
+							"latency_ms":  time.Since(attemptStart).Milliseconds(),
 						},
 					})
-					log.Debugf("[UnifiedRouting] Stream: non-retryable error, returning immediately: %v", err)
-					trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
-					e.metrics.RecordRequest(trace)
-					return nil, err
+					continue
 				}
+				chunks = res.chunks
+			case <-firstChunkTimer.C:
+				connTimedOut = true
+			}
 
-				// Retryable — cooldown and try next target
-				e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
+			if connTimedOut {
+				// Connection was not established within the timeout.
+				attemptLatency := time.Since(attemptStart).Milliseconds()
+				errMsg := fmt.Sprintf("connection timeout (%s)", failoverFirstChunkTimeout)
+				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(err.Error())
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+					Failed(errMsg)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
 					Type:     EventCooldownStarted,
 					RouteID:  decision.RouteID,
 					TargetID: target.ID,
 					Details: map[string]any{
-						"duration_seconds": int(cooldownDuration.Seconds()),
-						"reason":           err.Error(),
-						"error_class":      errClass.String(),
-						"latency_ms":       time.Since(attemptStart).Milliseconds(),
+						"reason":     errMsg,
+						"latency_ms": attemptLatency,
 					},
 				})
+				// The goroutine running executeFunc will finish when ctx is canceled.
+				// If it returns a channel, drain it in background.
+				go func() {
+					res := <-connCh
+					if res.chunks != nil {
+						for range res.chunks {
+						}
+					}
+				}()
 				continue
 			}
 
-			// Got a channel, now wait for the first chunk to validate the connection.
-			// Apply a timeout so that an unresponsive target doesn't block failover.
+			// Phase 2: connection established, wait for the first data chunk.
+			// Reuse the same timer (remaining time from failoverFirstChunkTimeout).
 			var firstChunk cliproxyexecutor.StreamChunk
 			var ok bool
 
-			firstChunkTimer := time.NewTimer(failoverFirstChunkTimeout)
 			select {
 			case firstChunk, ok = <-chunks:
 				firstChunkTimer.Stop()
@@ -578,15 +627,15 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed(errMsg)
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
 					Type:     EventCooldownStarted,
 					RouteID:  decision.RouteID,
 					TargetID: target.ID,
 					Details: map[string]any{
-						"duration_seconds": int(cooldownDuration.Seconds()),
-						"reason":           errMsg,
-						"latency_ms":       attemptLatency,
+						"reason":     errMsg,
+						"latency_ms": attemptLatency,
 					},
 				})
 				// Drain remaining chunks in background to prevent goroutine leak
@@ -603,15 +652,15 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 				e.stateMgr.RecordFailure(ctx, target.ID, "stream closed without data")
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed("stream closed without data")
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
 					Type:     EventCooldownStarted,
 					RouteID:  decision.RouteID,
 					TargetID: target.ID,
 					Details: map[string]any{
-						"duration_seconds": int(cooldownDuration.Seconds()),
-						"reason":           "stream closed without data",
-						"latency_ms":       attemptLatency,
+						"reason":     "stream closed without data",
+						"latency_ms": attemptLatency,
 					},
 				})
 				continue
@@ -651,16 +700,16 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed(errMsg)
-				e.stateMgr.StartCooldown(ctx, target.ID, cooldownDuration)
+				e.stateMgr.StartCooldownTimed(ctx, target.ID)
+				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
 					Type:     EventCooldownStarted,
 					RouteID:  decision.RouteID,
 					TargetID: target.ID,
 					Details: map[string]any{
-						"duration_seconds": int(cooldownDuration.Seconds()),
-						"reason":           errMsg,
-						"error_class":      chunkErrClass.String(),
-						"latency_ms":       attemptLatency,
+						"reason":      errMsg,
+						"error_class": chunkErrClass.String(),
+						"latency_ms":  attemptLatency,
 					},
 				})
 				continue

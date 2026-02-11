@@ -1198,6 +1198,8 @@ func (s *Server) executeWithUnifiedRoutingFailover(c *gin.Context, engine unifie
 // executeWithUnifiedRoutingFailoverFormat executes a request with full multi-layer failover support for any format.
 func (s *Server) executeWithUnifiedRoutingFailoverFormat(c *gin.Context, engine unifiedrouting.RoutingEngine, modelName string, rawBody []byte, stream bool, sourceFormat sdktranslator.Format) {
 	ctx := c.Request.Context()
+	// Inject Gin context so executor can record each attempt (API_REQUEST/API_RESPONSE) for detailed request log.
+	ctx = context.WithValue(ctx, "gin", c)
 
 	// Get routing decision
 	routingEngine, ok := engine.(*unifiedrouting.DefaultRoutingEngine)

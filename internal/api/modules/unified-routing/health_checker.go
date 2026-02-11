@@ -19,6 +19,13 @@ type HealthChecker interface {
 	CheckAll(ctx context.Context) ([]*HealthResult, error)
 	CheckRoute(ctx context.Context, routeID string) ([]*HealthResult, error)
 	CheckTarget(ctx context.Context, targetID string) (*HealthResult, error)
+	// TriggerCheckUntimedCoolingTargets runs health checks on untimed-cooling targets for the route (async).
+	TriggerCheckUntimedCoolingTargets(ctx context.Context, routeID string)
+
+	// ScheduleTargetCheck schedules a health check for a target at its CooldownEndsAt time.
+	// Called after StartCooldownTimed to set up the per-target timer.
+	// Safe to call multiple times; replaces any existing scheduled check.
+	ScheduleTargetCheck(targetID string)
 
 	// Configuration
 	GetSettings(ctx context.Context) (*HealthCheckConfig, error)
@@ -34,17 +41,22 @@ type HealthChecker interface {
 
 // DefaultHealthChecker implements HealthChecker.
 type DefaultHealthChecker struct {
-	configSvc    ConfigService
-	stateMgr     StateManager
-	metrics      MetricsCollector
-	authManager  *coreauth.Manager
-	
-	mu           sync.RWMutex
-	history      []*HealthResult
-	maxHistory   int
-	
-	stopChan     chan struct{}
-	running      bool
+	configSvc       ConfigService
+	stateMgr        StateManager
+	metrics         MetricsCollector
+	authManager     *coreauth.Manager
+	routeActivity   *RouteActivityTracker
+
+	mu        sync.RWMutex
+	history   []*HealthResult
+	maxHistory int
+
+	// Per-target scheduled health check timers.
+	// Each target in timed cooling gets its own timer that fires at CooldownEndsAt.
+	timerMu         sync.Mutex
+	scheduledTimers map[string]*time.Timer
+
+	running  bool
 }
 
 // NewHealthChecker creates a new health checker.
@@ -53,15 +65,20 @@ func NewHealthChecker(
 	stateMgr StateManager,
 	metrics MetricsCollector,
 	authManager *coreauth.Manager,
+	routeActivity *RouteActivityTracker,
 ) *DefaultHealthChecker {
+	if routeActivity == nil {
+		routeActivity = NewRouteActivityTracker()
+	}
 	return &DefaultHealthChecker{
-		configSvc:   configSvc,
-		stateMgr:    stateMgr,
-		metrics:     metrics,
-		authManager: authManager,
-		history:     make([]*HealthResult, 0, 1000),
-		maxHistory:  1000,
-		stopChan:    make(chan struct{}),
+		configSvc:       configSvc,
+		stateMgr:        stateMgr,
+		metrics:         metrics,
+		authManager:     authManager,
+		routeActivity:   routeActivity,
+		history:         make([]*HealthResult, 0, 1000),
+		maxHistory:      1000,
+		scheduledTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -342,10 +359,10 @@ func (h *DefaultHealthChecker) Start(ctx context.Context) error {
 		return nil
 	}
 	h.running = true
-	h.stopChan = make(chan struct{})
 	h.mu.Unlock()
 
-	go h.runBackgroundChecks(ctx)
+	// Schedule checks for any targets already in timed cooling (e.g. after restart).
+	h.scheduleExistingCoolingTargets()
 	return nil
 }
 
@@ -357,64 +374,206 @@ func (h *DefaultHealthChecker) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	close(h.stopChan)
 	h.running = false
+
+	// Cancel all per-target timers.
+	h.timerMu.Lock()
+	for id, t := range h.scheduledTimers {
+		t.Stop()
+		delete(h.scheduledTimers, id)
+	}
+	h.timerMu.Unlock()
+
 	return nil
 }
 
-func (h *DefaultHealthChecker) runBackgroundChecks(ctx context.Context) {
-	// Get check interval from config
-	healthConfig, _ := h.configSvc.GetHealthCheckConfig(ctx)
-	if healthConfig == nil {
-		cfg := DefaultHealthCheckConfig()
-		healthConfig = &cfg
-	}
-
-	ticker := time.NewTicker(time.Duration(healthConfig.CheckIntervalSeconds) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Check targets that are in cooldown
-			h.checkCoolingTargets(ctx)
-
-		case <-h.stopChan:
-			return
-
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (h *DefaultHealthChecker) checkCoolingTargets(ctx context.Context) {
+// scheduleExistingCoolingTargets scans all target states on startup and schedules
+// timers for any targets already in timed cooling.
+func (h *DefaultHealthChecker) scheduleExistingCoolingTargets() {
+	ctx := context.Background()
 	states, err := h.stateMgr.ListTargetStates(ctx)
 	if err != nil {
 		return
 	}
-
 	for _, state := range states {
-		if state.Status != StatusCooling {
-			continue
-		}
-
-		// Health check is the primary recovery mechanism.
-		// Check ALL cooling targets on every cycle — don't wait for
-		// cooldown to expire. The cooldown timer (CooldownEndsAt) only
-		// serves as a safety net for automatic recovery when the health
-		// checker is not running.
-		result, err := h.CheckTarget(ctx, state.TargetID)
-		if err != nil {
-			log.Debugf("health check failed for target %s: %v", state.TargetID, err)
-			continue
-		}
-
-		if result.Status == "healthy" {
-			h.stateMgr.EndCooldown(ctx, state.TargetID)
-			log.Infof("target %s recovered after health check", state.TargetID)
+		if state.Status == StatusCooling && state.CooldownEndsAt != nil {
+			h.ScheduleTargetCheck(state.TargetID)
 		}
 	}
+}
+
+// ScheduleTargetCheck schedules a health check for the given target at its CooldownEndsAt time.
+// It reads the target's current state to determine when to fire.
+// Safe to call multiple times — replaces any existing scheduled check for this target.
+func (h *DefaultHealthChecker) ScheduleTargetCheck(targetID string) {
+	ctx := context.Background()
+
+	// Read the target state to get CooldownEndsAt.
+	state, _ := h.stateMgr.GetTargetState(ctx, targetID)
+	if state == nil || state.Status != StatusCooling || state.CooldownEndsAt == nil {
+		return
+	}
+
+	delay := time.Until(*state.CooldownEndsAt)
+	if delay < 0 {
+		delay = 0 // already expired, check immediately
+	}
+
+	h.timerMu.Lock()
+	defer h.timerMu.Unlock()
+
+	// Cancel existing timer for this target.
+	if t, ok := h.scheduledTimers[targetID]; ok {
+		t.Stop()
+	}
+
+	h.scheduledTimers[targetID] = time.AfterFunc(delay, func() {
+		h.onTargetCheckDue(targetID)
+	})
+}
+
+// onTargetCheckDue is the callback when a per-target timer fires.
+// It runs the health check and either recovers the target, reschedules, or moves to untimed.
+func (h *DefaultHealthChecker) onTargetCheckDue(targetID string) {
+	// Clean up timer reference.
+	h.timerMu.Lock()
+	delete(h.scheduledTimers, targetID)
+	h.timerMu.Unlock()
+
+	// Check if we've been stopped.
+	h.mu.RLock()
+	running := h.running
+	h.mu.RUnlock()
+	if !running {
+		return
+	}
+
+	ctx := context.Background()
+
+	// Verify target is still in timed cooling.
+	state, _ := h.stateMgr.GetTargetState(ctx, targetID)
+	if state == nil || state.Status != StatusCooling || state.CooldownEndsAt == nil {
+		return // already recovered or switched to untimed
+	}
+
+	// Transition to "checking" so the frontend shows "检查中" instead of "冷却中".
+	h.stateMgr.StartChecking(ctx, targetID)
+
+	// Run health check.
+	result, err := h.CheckTarget(ctx, targetID)
+	if err != nil {
+		log.Debugf("scheduled health check failed for target %s: %v", targetID, err)
+		// Reschedule with the same interval so we retry later.
+		interval := h.getCheckInterval(ctx)
+		h.stateMgr.SetCooldownNextCheckIn(ctx, targetID, interval)
+		h.ScheduleTargetCheck(targetID)
+		return
+	}
+
+	if result.Status == "healthy" {
+		h.stateMgr.EndCooldown(ctx, targetID)
+		log.Infof("target %s recovered after scheduled health check", targetID)
+		return
+	}
+
+	// Still unhealthy — decide timed vs untimed by route activity.
+	routeID := h.getRouteIDForTarget(ctx, targetID)
+	if h.routeActivity.IsProcessing(routeID) {
+		// Route active → schedule next check after another interval.
+		interval := h.getCheckInterval(ctx)
+		h.stateMgr.SetCooldownNextCheckIn(ctx, targetID, interval)
+		h.ScheduleTargetCheck(targetID) // reschedule
+	} else {
+		// Route not active → switch to untimed cooling (checked only on request).
+		h.stateMgr.StartCooldownUntimed(ctx, targetID)
+	}
+}
+
+// getCheckInterval returns the configured health check interval.
+func (h *DefaultHealthChecker) getCheckInterval(ctx context.Context) time.Duration {
+	if cfg, _ := h.configSvc.GetHealthCheckConfig(ctx); cfg != nil && cfg.CheckIntervalSeconds > 0 {
+		return time.Duration(cfg.CheckIntervalSeconds) * time.Second
+	}
+	return 30 * time.Second
+}
+
+// getRouteIDForTarget returns the route ID that contains the given target, or "" if not found.
+func (h *DefaultHealthChecker) getRouteIDForTarget(ctx context.Context, targetID string) string {
+	routes, err := h.configSvc.ListRoutes(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, route := range routes {
+		pipeline, err := h.configSvc.GetPipeline(ctx, route.ID)
+		if err != nil {
+			continue
+		}
+		for _, layer := range pipeline.Layers {
+			for _, t := range layer.Targets {
+				if t.ID == targetID {
+					return route.ID
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// TriggerCheckUntimedCoolingTargets runs health checks on cooling targets that need
+// on-request checking for the given route. This includes:
+// - Untimed cooling targets (CooldownEndsAt == nil)
+// - Timed cooling targets whose CooldownEndsAt has already passed (expired)
+// Called when a request arrives so these targets get a chance to recover.
+// Runs async; does not block the request.
+func (h *DefaultHealthChecker) TriggerCheckUntimedCoolingTargets(ctx context.Context, routeID string) {
+	// Use background context since this runs asynchronously and must not be
+	// cancelled when the originating HTTP request finishes.
+	bgCtx := context.Background()
+
+	pipeline, err := h.configSvc.GetPipeline(bgCtx, routeID)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	var checkTargetIDs []string
+	for _, layer := range pipeline.Layers {
+		for _, target := range layer.Targets {
+			if !target.Enabled {
+				continue
+			}
+			state, _ := h.stateMgr.GetTargetState(bgCtx, target.ID)
+			if state != nil && state.Status == StatusCooling &&
+				(state.CooldownEndsAt == nil || !now.Before(*state.CooldownEndsAt)) {
+				checkTargetIDs = append(checkTargetIDs, target.ID)
+			}
+		}
+	}
+	if len(checkTargetIDs) == 0 {
+		return
+	}
+	go func() {
+		var wg sync.WaitGroup
+		for _, targetID := range checkTargetIDs {
+			wg.Add(1)
+			go func(tid string) {
+				defer wg.Done()
+				// Transition to "checking" so the frontend shows "检查中".
+				h.stateMgr.StartChecking(bgCtx, tid)
+				result, err := h.CheckTarget(bgCtx, tid)
+				if err != nil {
+					return
+				}
+				if result.Status == "healthy" {
+					h.stateMgr.EndCooldown(bgCtx, tid)
+					log.Infof("target %s recovered after on-request health check", tid)
+				} else {
+					h.stateMgr.StartCooldownTimed(bgCtx, tid)
+					h.ScheduleTargetCheck(tid)
+				}
+			}(targetID)
+		}
+		wg.Wait()
+	}()
 }
 
 // TargetNotFoundError is returned when a target is not found.

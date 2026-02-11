@@ -1339,7 +1339,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		authType, authValue = auth.AccountInfo()
 	}
 	var payloadLog []byte
-	if e.cfg != nil && e.cfg.RequestLog {
+	if e.cfg != nil && (e.cfg.RequestLog || e.cfg.DetailedRequestLog) {
 		payloadLog = []byte(payloadStr)
 	}
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
