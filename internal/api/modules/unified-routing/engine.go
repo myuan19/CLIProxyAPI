@@ -288,8 +288,11 @@ func (e *DefaultRoutingEngine) selectRoundRobin(routeID string, level int, targe
 	}
 	e.mu.Unlock()
 
-	idx := counter.Load() - 1
-	return &targets[int(idx)%len(targets)]
+	val := counter.Load()
+	if val == 0 {
+		val = 1
+	}
+	return &targets[int(val-1)%len(targets)]
 }
 
 func (e *DefaultRoutingEngine) selectWeightedRoundRobin(routeID string, level int, targets []Target) *Target {
@@ -313,7 +316,11 @@ func (e *DefaultRoutingEngine) selectWeightedRoundRobin(routeID string, level in
 	}
 	e.mu.Unlock()
 
-	idx := int(counter.Load()-1) % totalWeight
+	val := counter.Load()
+	if val == 0 {
+		val = 1
+	}
+	idx := int(val-1) % totalWeight
 
 	// Find the target
 	cumulative := 0
@@ -369,6 +376,87 @@ const failoverFirstChunkTimeout = 15 * time.Second
 // body, so this is set higher than the streaming first-chunk timeout.
 const failoverNonStreamTimeout = 30 * time.Second
 
+// filterAvailableTargets returns enabled, healthy targets from a layer.
+func (e *DefaultRoutingEngine) filterAvailableTargets(ctx context.Context, layer *Layer) []Target {
+	available := make([]Target, 0, len(layer.Targets))
+	for _, target := range layer.Targets {
+		if !target.Enabled {
+			continue
+		}
+		state, _ := e.stateMgr.GetTargetState(ctx, target.ID)
+		if state != nil && state.Status != StatusHealthy {
+			continue
+		}
+		available = append(available, target)
+	}
+	return available
+}
+
+// selectStartIndex determines the starting index in the available targets
+// slice based on the layer's load-balancing strategy. This is called once
+// per layer; the failover loop then iterates sequentially from this position.
+func (e *DefaultRoutingEngine) selectStartIndex(routeID string, level int, strategy LoadStrategy, ctx context.Context, targets []Target) int {
+	if len(targets) == 0 {
+		return 0
+	}
+
+	switch strategy {
+	case StrategyRoundRobin, "":
+		key := fmt.Sprintf("%s:%d", routeID, level)
+		e.mu.Lock()
+		counter, ok := e.rrCounters[key]
+		if !ok {
+			counter = &atomic.Uint64{}
+			e.rrCounters[key] = counter
+		}
+		e.mu.Unlock()
+		val := counter.Load()
+		if val == 0 {
+			val = 1
+		}
+		return int(val-1) % len(targets)
+
+	case StrategyWeightedRound:
+		selected := e.selectWeightedRoundRobin(routeID, level, targets)
+		for i := range targets {
+			if targets[i].ID == selected.ID {
+				return i
+			}
+		}
+		return 0
+
+	case StrategyRandom:
+		return rand.Intn(len(targets))
+
+	case StrategyFirstAvailable:
+		return 0
+
+	case StrategyLeastConn:
+		selected := e.selectLeastConnections(ctx, targets)
+		for i := range targets {
+			if targets[i].ID == selected.ID {
+				return i
+			}
+		}
+		return 0
+
+	default:
+		key := fmt.Sprintf("%s:%d", routeID, level)
+		e.mu.Lock()
+		counter, ok := e.rrCounters[key]
+		if !ok {
+			counter = &atomic.Uint64{}
+			e.rrCounters[key] = counter
+		}
+		e.mu.Unlock()
+		val := counter.Load()
+		if val == 0 {
+			val = 1
+		}
+		return int(val-1) % len(targets)
+	}
+}
+
 // ExecuteWithFailover executes a request with automatic failover.
 func (e *DefaultRoutingEngine) ExecuteWithFailover(
 	ctx context.Context,
@@ -391,34 +479,32 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 	for layerIdx, layer := range decision.Pipeline.Layers {
 		e.AdvanceRoundRobin(decision.RouteID, layer.Level)
 
-		// Keep trying targets in this layer until no available targets remain
-		// SelectTarget automatically excludes cooling-down targets
-		for {
-			target, err := e.SelectTarget(ctx, decision.RouteID, &layer)
-			if err != nil {
-				// No available targets in this layer, move to next layer
-				break
-			}
+		availableTargets := e.filterAvailableTargets(ctx, &layer)
+		idx := e.selectStartIndex(decision.RouteID, layer.Level, layer.Strategy, ctx, availableTargets)
 
-			// Find auth for this target
+		for len(availableTargets) > 0 {
+			if idx >= len(availableTargets) {
+				idx = 0
+			}
+			target := availableTargets[idx]
+
 			auth := e.findAuth(target.CredentialID)
 			if auth == nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed("credential not found")
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
-			// Execute request with per-attempt timeout
 			attemptStart := time.Now()
 			execCtx, execCancel := context.WithTimeout(ctx, failoverNonStreamTimeout)
-			err = executeFunc(execCtx, auth, target.Model)
+			err := executeFunc(execCtx, auth, target.Model)
 			execCancel()
 			attemptLatency := time.Since(attemptStart).Milliseconds()
 
 			if err == nil {
-				// Success - record and return
 				e.stateMgr.RecordSuccess(ctx, target.ID, time.Since(attemptStart))
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Success(attemptLatency)
@@ -428,7 +514,6 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				return nil
 			}
 
-			// Classify the error to decide whether to retry on another target
 			errClass := ClassifyError(err)
 
 			if errClass == ErrorClassNonRetryable {
@@ -448,7 +533,6 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				return err
 			}
 
-			// Retryable (node-level) failure — cooldown this target and try next
 			e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
 			traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 				Failed(err.Error(), attemptLatency)
@@ -464,7 +548,7 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				},
 			})
 
-			// Continue loop - SelectTarget will automatically exclude cooling-down targets
+			availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 		}
 
 		// Record layer fallback event when moving to next layer
@@ -515,29 +599,25 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 	for layerIdx, layer := range decision.Pipeline.Layers {
 		e.AdvanceRoundRobin(decision.RouteID, layer.Level)
 
-		// Keep trying targets in this layer until no available targets remain
-		for {
-			target, err := e.SelectTarget(ctx, decision.RouteID, &layer)
-			if err != nil {
-				// No available targets in this layer, move to next layer
-				break
-			}
+		availableTargets := e.filterAvailableTargets(ctx, &layer)
+		idx := e.selectStartIndex(decision.RouteID, layer.Level, layer.Strategy, ctx, availableTargets)
 
-			// Find auth for this target
+		for len(availableTargets) > 0 {
+			if idx >= len(availableTargets) {
+				idx = 0
+			}
+			target := availableTargets[idx]
+
 			auth := e.findAuth(target.CredentialID)
 			if auth == nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed("credential not found")
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
-			// Try to execute streaming request.
-			// The single failoverFirstChunkTimeout covers BOTH the connection
-			// establishment AND the wait for the first data chunk.  We run
-			// executeFunc in a goroutine so the timer can fire even when the
-			// upstream is slow to accept the TCP connection.
 			attemptStart := time.Now()
 
 			type streamConnResult struct {
@@ -552,14 +632,12 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 
 			firstChunkTimer := time.NewTimer(failoverFirstChunkTimeout)
 
-			// Phase 1: wait for executeFunc to return (connection established).
 			var chunks <-chan cliproxyexecutor.StreamChunk
 			var connTimedOut bool
 			select {
 			case res := <-connCh:
 				if res.err != nil {
 					firstChunkTimer.Stop()
-					// Classify the connection error
 					errClass := ClassifyError(res.err)
 
 					if errClass == ErrorClassNonRetryable {
@@ -580,7 +658,6 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						return nil, res.err
 					}
 
-					// Retryable — cooldown and try next target
 					connLatency := time.Since(attemptStart).Milliseconds()
 					e.stateMgr.RecordFailure(ctx, target.ID, res.err.Error())
 					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
@@ -597,6 +674,7 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 							"latency_ms":  time.Since(attemptStart).Milliseconds(),
 						},
 					})
+					availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 					continue
 				}
 				chunks = res.chunks
@@ -621,8 +699,6 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						"latency_ms": attemptLatency,
 					},
 				})
-				// The goroutine running executeFunc will finish when ctx is canceled.
-				// If it returns a channel, drain it in background.
 				go func() {
 					res := <-connCh
 					if res.chunks != nil {
@@ -630,11 +706,10 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						}
 					}
 				}()
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
-			// Phase 2: connection established, wait for the first data chunk.
-			// Reuse the same timer (remaining time from failoverFirstChunkTimeout).
 			var firstChunk cliproxyexecutor.StreamChunk
 			var ok bool
 
@@ -658,11 +733,11 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						"latency_ms": attemptLatency,
 					},
 				})
-				// Drain remaining chunks in background to prevent goroutine leak
 				go func() {
 					for range chunks {
 					}
 				}()
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
@@ -682,15 +757,14 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						"latency_ms": attemptLatency,
 					},
 				})
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
 			if firstChunk.Err != nil {
-				// Classify the first-chunk error
 				chunkErrClass := ClassifyError(firstChunk.Err)
 				errMsg := firstChunk.Err.Error()
 
-				// Drain remaining chunks to prevent goroutine leak
 				go func() {
 					for range chunks {
 					}
@@ -715,7 +789,6 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					return nil, firstChunk.Err
 				}
 
-				// Retryable — cooldown and try next target
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Failed(errMsg, attemptLatency)
@@ -731,24 +804,19 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 						"latency_ms":  attemptLatency,
 					},
 				})
+				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
 				continue
 			}
 
-			// First chunk is successful! Create a new channel that forwards all chunks
-			// and record success after stream completes
 			outputChan := make(chan cliproxyexecutor.StreamChunk, 100)
-
-			// Write first chunk to buffer BEFORE starting goroutine to avoid race condition
 			outputChan <- firstChunk
 
-			// Capture loop variables for goroutine to avoid closure issues
 			capturedTarget := target
 			capturedAttemptStart := attemptStart
 
 			go func() {
 				defer close(outputChan)
 
-				// Forward remaining chunks
 				var streamErr error
 				for chunk := range chunks {
 					if chunk.Err != nil {
@@ -757,11 +825,8 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					outputChan <- chunk
 				}
 
-				// Record result after stream completes
 				attemptLatency := time.Since(capturedAttemptStart).Milliseconds()
 				if streamErr != nil {
-					// Stream had an error mid-way, but we already committed to this target
-					// Just log it, don't start cooldown since connection was initially good
 					log.Warnf("[UnifiedRouting] Stream error after successful start: %v", streamErr)
 				}
 				e.stateMgr.RecordSuccess(ctx, capturedTarget.ID, time.Since(capturedAttemptStart))

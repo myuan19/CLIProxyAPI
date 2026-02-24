@@ -25,9 +25,10 @@ func (h *Handler) GetDetailedRequestLog(c *gin.Context) {
 	}
 
 	result := gin.H{
-		"detailed-request-log":              enabled,
-		"detailed-request-log-max-size-mb":  maxSizeMB,
-		"detailed-request-log-show-retries": h.cfg.DetailedRequestLogShowRetries,
+		"detailed-request-log":                enabled,
+		"detailed-request-log-max-size-mb":    maxSizeMB,
+		"detailed-request-log-show-retries":   h.cfg.DetailedRequestLogShowRetries,
+		"detailed-request-log-show-simulated": h.cfg.DetailedRequestLogShowSimulated,
 	}
 
 	// Include stats if logger is available
@@ -52,15 +53,16 @@ func (h *Handler) PutDetailedRequestLog(c *gin.Context) {
 	}
 
 	var body struct {
-		Value       *bool `json:"value"`
-		ShowRetries *bool `json:"show_retries"`
+		Value         *bool `json:"value"`
+		ShowRetries   *bool `json:"show_retries"`
+		ShowSimulated *bool `json:"show_simulated"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	if body.Value == nil && body.ShowRetries == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body, expected {\"value\": true/false} and/or {\"show_retries\": true/false}"})
+	if body.Value == nil && body.ShowRetries == nil && body.ShowSimulated == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body, expected {\"value\": true/false} and/or {\"show_retries\": true/false} and/or {\"show_simulated\": true/false}"})
 		return
 	}
 
@@ -72,6 +74,9 @@ func (h *Handler) PutDetailedRequestLog(c *gin.Context) {
 	}
 	if body.ShowRetries != nil {
 		h.cfg.DetailedRequestLogShowRetries = *body.ShowRetries
+	}
+	if body.ShowSimulated != nil {
+		h.cfg.DetailedRequestLogShowSimulated = *body.ShowSimulated
 	}
 
 	h.persist(c)
@@ -98,8 +103,9 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 		apiKeyFilter = strings.TrimSpace(c.Query("api_key"))
 	}
 	filter := logging.RecordFilter{
-		APIKeyHash: apiKeyFilter,
-		StatusCode: strings.TrimSpace(c.Query("status_code")),
+		APIKeyHash:       apiKeyFilter,
+		StatusCode:       strings.TrimSpace(c.Query("status_code")),
+		IncludeSimulated: c.Query("include_simulated") == "true",
 	}
 
 	// Parse pagination
@@ -133,10 +139,20 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 		}
 	}
 
-	summaries, total, apiKeys, err := h.detailedLogger.ReadRecordSummaries(filter)
+	summaries, total, _, err := h.detailedLogger.ReadRecordSummaries(filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read records: %v", err)})
 		return
+	}
+
+	// Build API keys list from actual configured keys instead of log-derived keys
+	apiKeys := make([]string, 0)
+	if h.cfg != nil {
+		for _, key := range h.cfg.APIKeys {
+			if key != "" {
+				apiKeys = append(apiKeys, logging.MaskAPIKey(key))
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

@@ -4,7 +4,6 @@
 package logging
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -23,8 +22,11 @@ const (
 	// detailedFilePrefix is the prefix for individual detail log files.
 	detailedFilePrefix = "detail-"
 
-	// detailedFileSuffix is the file extension for detail log files.
+	// detailedFileSuffix is the file extension for meta files (no bodies).
 	detailedFileSuffix = ".json"
+
+	// detailedBodiesSuffix is the suffix for body-data companion files.
+	detailedBodiesSuffix = ".bodies.json"
 
 	// legacyDetailedLogFileName is the old JSONL file name (for backward compatibility).
 	legacyDetailedLogFileName = "detailed-requests.jsonl"
@@ -59,24 +61,26 @@ type DetailedRequestRecord struct {
 	Attempts        []DetailedAttempt   `json:"attempts,omitempty"`
 	TotalDurationMs int64               `json:"total_duration_ms"`
 	IsStreaming     bool                `json:"is_streaming"`
+	IsSimulated     bool                `json:"is_simulated,omitempty"`
 	Error           string              `json:"error,omitempty"`
 }
 
 // DetailedRequestSummary is a lightweight projection of DetailedRequestRecord
 // returned by the list endpoint so the frontend doesn't have to download full bodies.
 type DetailedRequestSummary struct {
-	ID              string `json:"id"`
+	ID              string    `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
-	APIKey          string `json:"api_key"`
-	APIKeyHash      string `json:"api_key_hash"`
-	URL             string `json:"url"`
-	Method          string `json:"method"`
-	StatusCode      int    `json:"status_code"`
-	Model           string `json:"model,omitempty"`
-	TotalDurationMs int64  `json:"total_duration_ms"`
-	IsStreaming     bool   `json:"is_streaming"`
-	Error           string `json:"error,omitempty"`
-	AttemptCount    int    `json:"attempt_count"`
+	APIKey          string    `json:"api_key"`
+	APIKeyHash      string    `json:"api_key_hash"`
+	URL             string    `json:"url"`
+	Method          string    `json:"method"`
+	StatusCode      int       `json:"status_code"`
+	Model           string    `json:"model,omitempty"`
+	TotalDurationMs int64     `json:"total_duration_ms"`
+	IsStreaming     bool      `json:"is_streaming"`
+	IsSimulated     bool      `json:"is_simulated,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	AttemptCount    int       `json:"attempt_count"`
 }
 
 // ToSummary converts a full record to a lightweight summary.
@@ -92,6 +96,7 @@ func (r *DetailedRequestRecord) ToSummary() DetailedRequestSummary {
 		Model:           r.Model,
 		TotalDurationMs: r.TotalDurationMs,
 		IsStreaming:     r.IsStreaming,
+		IsSimulated:     r.IsSimulated,
 		Error:           r.Error,
 		AttemptCount:    len(r.Attempts),
 	}
@@ -113,6 +118,95 @@ type DetailedAttempt struct {
 	DurationMs      int64               `json:"duration_ms,omitempty"`
 }
 
+// DetailedAttemptBodies holds body data for a single attempt.
+type DetailedAttemptBodies struct {
+	Index        int    `json:"index"`
+	RequestBody  string `json:"request_body,omitempty"`
+	ResponseBody string `json:"response_body,omitempty"`
+}
+
+// DetailedRecordBodies holds all body data for a record, stored separately
+// from the metadata to allow fast listing without parsing large bodies.
+type DetailedRecordBodies struct {
+	ID           string                 `json:"id"`
+	RequestBody  string                 `json:"request_body,omitempty"`
+	ResponseBody string                 `json:"response_body,omitempty"`
+	Attempts     []DetailedAttemptBodies `json:"attempts,omitempty"`
+}
+
+// prettyFormatBody formats a body string: if it's valid JSON, pretty-prints it;
+// otherwise returns as-is.
+func prettyFormatBody(body string) string {
+	if body == "" {
+		return body
+	}
+	trimmed := strings.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return body
+	}
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		var obj interface{}
+		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+			formatted, err2 := json.MarshalIndent(obj, "", "  ")
+			if err2 == nil {
+				return string(formatted)
+			}
+		}
+	}
+	return body
+}
+
+// stripBodies returns a copy of the record with all body fields cleared,
+// and a DetailedRecordBodies containing the extracted (pre-formatted) body data.
+func stripBodies(record *DetailedRequestRecord) (*DetailedRequestRecord, *DetailedRecordBodies) {
+	bodies := &DetailedRecordBodies{
+		ID:           record.ID,
+		RequestBody:  prettyFormatBody(record.RequestBody),
+		ResponseBody: prettyFormatBody(record.ResponseBody),
+	}
+
+	meta := *record
+	meta.RequestBody = ""
+	meta.ResponseBody = ""
+
+	if len(record.Attempts) > 0 {
+		metaAttempts := make([]DetailedAttempt, len(record.Attempts))
+		for i, a := range record.Attempts {
+			bodies.Attempts = append(bodies.Attempts, DetailedAttemptBodies{
+				Index:        a.Index,
+				RequestBody:  prettyFormatBody(a.RequestBody),
+				ResponseBody: prettyFormatBody(a.ResponseBody),
+			})
+			metaAttempts[i] = a
+			metaAttempts[i].RequestBody = ""
+			metaAttempts[i].ResponseBody = ""
+		}
+		meta.Attempts = metaAttempts
+	}
+
+	return &meta, bodies
+}
+
+// mergeBodies restores body content from a bodies file back into a meta record.
+func mergeBodies(meta *DetailedRequestRecord, bodies *DetailedRecordBodies) {
+	if bodies == nil {
+		return
+	}
+	meta.RequestBody = bodies.RequestBody
+	meta.ResponseBody = bodies.ResponseBody
+
+	bodyMap := make(map[int]DetailedAttemptBodies, len(bodies.Attempts))
+	for _, ab := range bodies.Attempts {
+		bodyMap[ab.Index] = ab
+	}
+	for i := range meta.Attempts {
+		if ab, ok := bodyMap[meta.Attempts[i].Index]; ok {
+			meta.Attempts[i].RequestBody = ab.RequestBody
+			meta.Attempts[i].ResponseBody = ab.ResponseBody
+		}
+	}
+}
+
 // DetailedRequestLogger handles structured logging of detailed request records
 // as individual JSON files in the logs directory.
 type DetailedRequestLogger struct {
@@ -125,7 +219,6 @@ type DetailedRequestLogger struct {
 	stopCh       chan struct{}
 	stopped      bool
 	writeCount   int64 // counts writes for periodic cleanup
-	migrated     bool  // whether legacy JSONL has been checked
 }
 
 // NewDetailedRequestLogger creates a new detailed request logger.
@@ -211,26 +304,37 @@ func (dl *DetailedRequestLogger) writeLoop() {
 	}
 }
 
-// writeRecordFile writes a single record as an individual JSON file.
+// writeRecordFile writes a single record as two files: meta (no bodies) and bodies.
 func (dl *DetailedRequestLogger) writeRecordFile(record *DetailedRequestRecord) error {
 	if err := os.MkdirAll(dl.logsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create logs directory: %w", err)
 	}
 
-	filename := dl.generateDetailFilename(record)
-	filePath := filepath.Join(dl.logsDir, filename)
+	baseFilename := dl.generateDetailFilename(record)
+	metaPath := filepath.Join(dl.logsDir, baseFilename)
+	bodiesFilename := strings.TrimSuffix(baseFilename, detailedFileSuffix) + detailedBodiesSuffix
+	bodiesPath := filepath.Join(dl.logsDir, bodiesFilename)
 
-	data, err := json.MarshalIndent(record, "", "  ")
+	meta, bodies := stripBodies(record)
+
+	metaData, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal record: %w", err)
+		return fmt.Errorf("failed to marshal meta: %w", err)
 	}
-	data = append(data, '\n')
-
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write record file: %w", err)
+	metaData = append(metaData, '\n')
+	if err := os.WriteFile(metaPath, metaData, 0644); err != nil {
+		return fmt.Errorf("failed to write meta file: %w", err)
 	}
 
-	// Periodic cleanup
+	bodiesData, err := json.MarshalIndent(bodies, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal bodies: %w", err)
+	}
+	bodiesData = append(bodiesData, '\n')
+	if err := os.WriteFile(bodiesPath, bodiesData, 0644); err != nil {
+		return fmt.Errorf("failed to write bodies file: %w", err)
+	}
+
 	dl.mu.Lock()
 	dl.writeCount++
 	shouldCleanup := dl.writeCount%cleanupInterval == 0
@@ -281,7 +385,7 @@ func sanitizePathForFilename(path string) string {
 	return sanitized
 }
 
-// cleanupOldFiles removes the oldest detail files when limits are exceeded.
+// cleanupOldFiles removes the oldest detail file pairs when limits are exceeded.
 func (dl *DetailedRequestLogger) cleanupOldFiles() {
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
@@ -294,7 +398,9 @@ func (dl *DetailedRequestLogger) cleanupOldFiles() {
 		modTime time.Time
 	}
 
-	var files []fileInfo
+	// Build a set of all file sizes for companion lookup
+	allSizes := make(map[string]int64)
+	var metaFiles []fileInfo
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -307,16 +413,19 @@ func (dl *DetailedRequestLogger) cleanupOldFiles() {
 		if errInfo != nil {
 			continue
 		}
-		files = append(files, fileInfo{name: name, size: info.Size(), modTime: info.ModTime()})
+		allSizes[name] = info.Size()
+
+		if isMetaFile(name) {
+			metaFiles = append(metaFiles, fileInfo{name: name, size: info.Size(), modTime: info.ModTime()})
+		}
 	}
 
-	if len(files) == 0 {
+	if len(metaFiles) == 0 {
 		return
 	}
 
-	// Sort by mod time, oldest first
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].modTime.Before(files[j].modTime)
+	sort.Slice(metaFiles, func(i, j int) bool {
+		return metaFiles[i].modTime.Before(metaFiles[j].modTime)
 	})
 
 	dl.mu.Lock()
@@ -324,23 +433,35 @@ func (dl *DetailedRequestLogger) cleanupOldFiles() {
 	maxBytes := int64(dl.maxSizeMB) * 1024 * 1024
 	dl.mu.Unlock()
 
-	// Calculate total size
 	var totalSize int64
-	for _, f := range files {
-		totalSize += f.size
+	for _, sz := range allSizes {
+		totalSize += sz
 	}
 
-	// Delete oldest files until within limits
-	for len(files) > maxFiles || (totalSize > maxBytes && len(files) > 0) {
-		oldest := files[0]
+	for len(metaFiles) > maxFiles || (totalSize > maxBytes && len(metaFiles) > 0) {
+		oldest := metaFiles[0]
 		if err := os.Remove(filepath.Join(dl.logsDir, oldest.name)); err == nil {
 			totalSize -= oldest.size
 		}
-		files = files[1:]
+		// Also remove companion bodies file
+		bodiesName := strings.TrimSuffix(oldest.name, detailedFileSuffix) + detailedBodiesSuffix
+		if sz, ok := allSizes[bodiesName]; ok {
+			if err := os.Remove(filepath.Join(dl.logsDir, bodiesName)); err == nil {
+				totalSize -= sz
+			}
+		}
+		metaFiles = metaFiles[1:]
 	}
 }
 
-// listDetailFiles returns all detail-*.json files sorted by mod time (newest first).
+// isMetaFile checks if a filename is a meta file (not a bodies companion file).
+func isMetaFile(name string) bool {
+	return strings.HasPrefix(name, detailedFilePrefix) &&
+		strings.HasSuffix(name, detailedFileSuffix) &&
+		!strings.HasSuffix(name, detailedBodiesSuffix)
+}
+
+// listDetailFiles returns all meta detail-*.json files sorted by mod time (newest first).
 func (dl *DetailedRequestLogger) listDetailFiles() ([]os.DirEntry, error) {
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
@@ -355,8 +476,7 @@ func (dl *DetailedRequestLogger) listDetailFiles() ([]os.DirEntry, error) {
 		if entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
-		if strings.HasPrefix(name, detailedFilePrefix) && strings.HasSuffix(name, detailedFileSuffix) {
+		if isMetaFile(entry.Name()) {
 			detailFiles = append(detailFiles, entry)
 		}
 	}
@@ -388,9 +508,8 @@ func (dl *DetailedRequestLogger) readRecordFromFile(filename string) (*DetailedR
 	return &record, nil
 }
 
-// ReadRecords reads records from individual detail files, applying optional filters.
-// Returns records in reverse chronological order (newest first).
-// Also reads from legacy JSONL file if it exists (for backward compatibility).
+// ReadRecords reads full records (meta + bodies) from individual detail files,
+// applying optional filters. Returns records in reverse chronological order.
 func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedRequestRecord, int, []string, error) {
 	detailFiles, err := dl.listDetailFiles()
 	if err != nil {
@@ -400,11 +519,15 @@ func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedReq
 	var allRecords []DetailedRequestRecord
 	apiKeySet := make(map[string]struct{})
 
-	// Read from individual files (already sorted newest first)
 	for _, entry := range detailFiles {
 		record, errRead := dl.readRecordFromFile(entry.Name())
 		if errRead != nil {
 			continue
+		}
+		// Try loading companion bodies file
+		bodiesName := strings.TrimSuffix(entry.Name(), detailedFileSuffix) + detailedBodiesSuffix
+		if bodies, errBodies := dl.readBodiesFromFile(bodiesName); errBodies == nil {
+			mergeBodies(record, bodies)
 		}
 		allRecords = append(allRecords, *record)
 		if record.APIKey != "" {
@@ -412,32 +535,14 @@ func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedReq
 		}
 	}
 
-	// Fallback: read legacy JSONL if it exists and no individual files
-	legacyRecords := dl.readLegacyJSONL()
-	if len(legacyRecords) > 0 {
-		// Reverse for newest first
-		for i, j := 0, len(legacyRecords)-1; i < j; i, j = i+1, j-1 {
-			legacyRecords[i], legacyRecords[j] = legacyRecords[j], legacyRecords[i]
-		}
-		for _, r := range legacyRecords {
-			if r.APIKey != "" {
-				apiKeySet[r.APIKey] = struct{}{}
-			}
-		}
-		allRecords = append(allRecords, legacyRecords...)
-	}
-
-	// Collect distinct API keys
 	apiKeys := make([]string, 0, len(apiKeySet))
 	for k := range apiKeySet {
 		apiKeys = append(apiKeys, k)
 	}
 
-	// Apply filters
 	filtered := dl.applyFilters(allRecords, filter)
 	total := len(filtered)
 
-	// Apply pagination
 	if filter.Offset > 0 {
 		if filter.Offset >= len(filtered) {
 			filtered = []DetailedRequestRecord{}
@@ -452,24 +557,69 @@ func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedReq
 	return filtered, total, apiKeys, nil
 }
 
-// ReadRecordSummaries is like ReadRecords but returns lightweight summaries
-// (no bodies, headers, or attempt details) for the list endpoint.
+// ReadRecordSummaries reads only lightweight meta files (no bodies) for fast listing.
 func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter) ([]DetailedRequestSummary, int, []string, error) {
-	records, total, apiKeys, err := dl.ReadRecords(filter)
+	detailFiles, err := dl.listDetailFiles()
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, fmt.Errorf("failed to list detail files: %w", err)
 	}
-	summaries := make([]DetailedRequestSummary, len(records))
-	for i := range records {
-		summaries[i] = records[i].ToSummary()
+
+	var allRecords []DetailedRequestRecord
+	apiKeySet := make(map[string]struct{})
+
+	// Only read meta files — no bodies, much faster
+	for _, entry := range detailFiles {
+		record, errRead := dl.readRecordFromFile(entry.Name())
+		if errRead != nil {
+			continue
+		}
+		allRecords = append(allRecords, *record)
+		if record.APIKey != "" {
+			apiKeySet[record.APIKey] = struct{}{}
+		}
+	}
+
+	apiKeys := make([]string, 0, len(apiKeySet))
+	for k := range apiKeySet {
+		apiKeys = append(apiKeys, k)
+	}
+
+	filtered := dl.applyFilters(allRecords, filter)
+	total := len(filtered)
+
+	if filter.Offset > 0 {
+		if filter.Offset >= len(filtered) {
+			filtered = []DetailedRequestRecord{}
+		} else {
+			filtered = filtered[filter.Offset:]
+		}
+	}
+	if filter.Limit > 0 && len(filtered) > filter.Limit {
+		filtered = filtered[:filter.Limit]
+	}
+
+	summaries := make([]DetailedRequestSummary, len(filtered))
+	for i := range filtered {
+		summaries[i] = filtered[i].ToSummary()
 	}
 	return summaries, total, apiKeys, nil
 }
 
-// ReadRecordByID reads a single record by its ID, checking individual files first,
-// then falling back to the legacy JSONL file.
+// readBodiesFromFile reads and parses a bodies companion file.
+func (dl *DetailedRequestLogger) readBodiesFromFile(filename string) (*DetailedRecordBodies, error) {
+	data, err := os.ReadFile(filepath.Join(dl.logsDir, filename))
+	if err != nil {
+		return nil, err
+	}
+	var bodies DetailedRecordBodies
+	if err := json.Unmarshal(data, &bodies); err != nil {
+		return nil, err
+	}
+	return &bodies, nil
+}
+
+// ReadRecordByID reads a single full record (meta + bodies) by its ID.
 func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestRecord, error) {
-	// First, try to find in individual files (ID is in filename)
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -483,10 +633,9 @@ func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestReco
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, detailedFilePrefix) || !strings.HasSuffix(name, detailedFileSuffix) {
+		if !isMetaFile(name) {
 			continue
 		}
-		// Quick check: ID should be in the filename
 		if !strings.Contains(name, id) {
 			continue
 		}
@@ -495,47 +644,18 @@ func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestReco
 			continue
 		}
 		if record.ID == id {
+			bodiesName := strings.TrimSuffix(name, detailedFileSuffix) + detailedBodiesSuffix
+			if bodies, errBodies := dl.readBodiesFromFile(bodiesName); errBodies == nil {
+				mergeBodies(record, bodies)
+			}
 			return record, nil
-		}
-	}
-
-	// Fallback: check legacy JSONL
-	filePath := filepath.Join(dl.logsDir, legacyDetailedLogFileName)
-	f, err := os.Open(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to open legacy detailed request log: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if !strings.Contains(line, id) {
-			continue
-		}
-		var record DetailedRequestRecord
-		if errUnmarshal := json.Unmarshal([]byte(line), &record); errUnmarshal != nil {
-			continue
-		}
-		if record.ID == id {
-			return &record, nil
 		}
 	}
 
 	return nil, nil
 }
 
-// DeleteAll removes all detail log files and the legacy JSONL file.
+// DeleteAll removes all detail log files (meta + bodies) and the legacy JSONL file.
 func (dl *DetailedRequestLogger) DeleteAll() error {
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
@@ -551,14 +671,9 @@ func (dl *DetailedRequestLogger) DeleteAll() error {
 			continue
 		}
 		name := entry.Name()
-		// Remove individual detail files
-		if strings.HasPrefix(name, detailedFilePrefix) && strings.HasSuffix(name, detailedFileSuffix) {
-			if errRm := os.Remove(filepath.Join(dl.logsDir, name)); errRm != nil {
-				lastErr = errRm
-			}
-		}
-		// Remove legacy JSONL
-		if name == legacyDetailedLogFileName {
+		isDetailFile := strings.HasPrefix(name, detailedFilePrefix) && strings.HasSuffix(name, detailedFileSuffix)
+		isLegacy := name == legacyDetailedLogFileName
+		if isDetailFile || isLegacy {
 			if errRm := os.Remove(filepath.Join(dl.logsDir, name)); errRm != nil {
 				lastErr = errRm
 			}
@@ -568,7 +683,7 @@ func (dl *DetailedRequestLogger) DeleteAll() error {
 	return lastErr
 }
 
-// GetStats returns size information about all detail log files.
+// GetStats returns size information about all detail log files (meta + bodies).
 func (dl *DetailedRequestLogger) GetStats() (int64, int, error) {
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
@@ -586,9 +701,7 @@ func (dl *DetailedRequestLogger) GetStats() (int64, int, error) {
 			continue
 		}
 		name := entry.Name()
-		isDetail := strings.HasPrefix(name, detailedFilePrefix) && strings.HasSuffix(name, detailedFileSuffix)
-		isLegacy := name == legacyDetailedLogFileName
-		if !isDetail && !isLegacy {
+		if !strings.HasPrefix(name, detailedFilePrefix) || !strings.HasSuffix(name, detailedFileSuffix) {
 			continue
 		}
 		info, errInfo := entry.Info()
@@ -596,87 +709,33 @@ func (dl *DetailedRequestLogger) GetStats() (int64, int, error) {
 			continue
 		}
 		totalSize += info.Size()
-		if isDetail {
+		if isMetaFile(name) {
 			count++
-		} else if isLegacy {
-			// Count lines in legacy file
-			count += dl.countLegacyRecords()
 		}
 	}
 
 	return totalSize, count, nil
 }
 
-// countLegacyRecords counts lines in the legacy JSONL file.
-func (dl *DetailedRequestLogger) countLegacyRecords() int {
-	filePath := filepath.Join(dl.logsDir, legacyDetailedLogFileName)
-	f, err := os.Open(filePath)
-	if err != nil {
-		return 0
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	count := 0
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) != "" {
-			count++
-		}
-	}
-	return count
-}
-
-// readLegacyJSONL reads records from the legacy JSONL file.
-func (dl *DetailedRequestLogger) readLegacyJSONL() []DetailedRequestRecord {
-	filePath := filepath.Join(dl.logsDir, legacyDetailedLogFileName)
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	var records []DetailedRequestRecord
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var record DetailedRequestRecord
-		if errUnmarshal := json.Unmarshal([]byte(line), &record); errUnmarshal != nil {
-			continue
-		}
-		records = append(records, record)
-	}
-
-	return records
-}
 
 // RecordFilter defines the criteria for filtering detailed request records.
 type RecordFilter struct {
-	APIKeyHash string
-	StatusCode string // e.g. "200", "4xx", "5xx"
-	After      time.Time
-	Before     time.Time
-	Offset     int
-	Limit      int
+	APIKeyHash       string
+	StatusCode       string // e.g. "200", "4xx", "5xx"
+	After            time.Time
+	Before           time.Time
+	Offset           int
+	Limit            int
+	IncludeSimulated bool // when false (default), simulated records are excluded
 }
 
 // applyFilters filters records based on the given criteria.
 func (dl *DetailedRequestLogger) applyFilters(records []DetailedRequestRecord, filter RecordFilter) []DetailedRequestRecord {
-	if filter.APIKeyHash == "" && filter.StatusCode == "" && filter.After.IsZero() && filter.Before.IsZero() {
-		return records
-	}
-
 	filtered := make([]DetailedRequestRecord, 0, len(records))
 	for _, r := range records {
+		if r.IsSimulated && !filter.IncludeSimulated {
+			continue
+		}
 		if filter.APIKeyHash != "" && r.APIKeyHash != filter.APIKeyHash && r.APIKey != filter.APIKeyHash {
 			continue
 		}

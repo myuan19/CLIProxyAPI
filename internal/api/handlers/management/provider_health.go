@@ -39,6 +39,7 @@ type ProviderHealth struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
 	Label       string `json:"label,omitempty"`
+	Prefix      string `json:"prefix,omitempty"`
 	BaseURL     string `json:"base_url,omitempty"`
 	Status      string `json:"status"` // "healthy", "unhealthy", "timeout"
 	Message     string `json:"message,omitempty"`
@@ -182,35 +183,20 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	checkProvider := func(auth *coreauth.Auth) {
+	checkOneModel := func(auth *coreauth.Auth, testModel *registry.ModelInfo) {
 		defer wg.Done()
 
 		providerType := getProviderType(auth)
 		baseURL := authAttribute(auth, "base_url")
 
-		// Get models for this provider
-		reg := registry.GetGlobalRegistry()
-		models := reg.GetModelsForClient(auth.ID)
-
-		// Apply model filter if specified
-		if len(modelFilterSet) > 0 {
-			filtered := make([]*registry.ModelInfo, 0)
-			for _, model := range models {
-				if _, ok := modelFilterSet[strings.ToLower(model.ID)]; ok {
-					filtered = append(filtered, model)
-				}
-			}
-			models = filtered
-		}
-
-		// If no models available, report as unhealthy
-		if len(models) == 0 {
+		if testModel == nil {
 			mu.Lock()
 			results = append(results, ProviderHealth{
 				ID:      auth.ID,
 				Name:    auth.Provider,
 				Type:    providerType,
 				Label:   auth.Label,
+				Prefix:  auth.Prefix,
 				BaseURL: baseURL,
 				Status:  "unhealthy",
 				Message: "no models available for this provider",
@@ -219,14 +205,10 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 			return
 		}
 
-		// Use the first model for health check
-		testModel := models[0]
-
 		startTime := time.Now()
 		checkCtx, cancel := context.WithTimeout(usage.WithSkipUsage(context.Background()), time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
 
-		// Build minimal OpenAI-format request for health check
 		openAIRequest := map[string]interface{}{
 			"model": testModel.ID,
 			"messages": []map[string]interface{}{
@@ -245,6 +227,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 				Name:        auth.Provider,
 				Type:        providerType,
 				Label:       auth.Label,
+				Prefix:      auth.Prefix,
 				BaseURL:     baseURL,
 				Status:      "unhealthy",
 				Message:     fmt.Sprintf("failed to build request: %v", err),
@@ -254,7 +237,6 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 			return
 		}
 
-		// Build executor request
 		req := cliproxyexecutor.Request{
 			Model:   testModel.ID,
 			Payload: requestJSON,
@@ -267,7 +249,6 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 			OriginalRequest: requestJSON,
 		}
 
-		// Execute stream directly with the specific auth
 		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, auth, req, opts)
 		if err != nil {
 			mu.Lock()
@@ -276,6 +257,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 				Name:        auth.Provider,
 				Type:        providerType,
 				Label:       auth.Label,
+				Prefix:      auth.Prefix,
 				BaseURL:     baseURL,
 				Status:      "unhealthy",
 				Message:     err.Error(),
@@ -285,7 +267,6 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 			return
 		}
 
-		// Wait for first chunk or timeout
 		select {
 		case chunk, ok := <-stream:
 			if ok {
@@ -296,6 +277,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 						Name:        auth.Provider,
 						Type:        providerType,
 						Label:       auth.Label,
+						Prefix:      auth.Prefix,
 						BaseURL:     baseURL,
 						Status:      "unhealthy",
 						Message:     chunk.Err.Error(),
@@ -310,7 +292,6 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 					return
 				}
 
-				// Got first chunk - provider is healthy
 				latency := time.Since(startTime).Milliseconds()
 				cancel()
 				go func() {
@@ -324,6 +305,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 					Name:        auth.Provider,
 					Type:        providerType,
 					Label:       auth.Label,
+					Prefix:      auth.Prefix,
 					BaseURL:     baseURL,
 					Status:      "healthy",
 					Latency:     latency,
@@ -337,6 +319,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 					Name:        auth.Provider,
 					Type:        providerType,
 					Label:       auth.Label,
+					Prefix:      auth.Prefix,
 					BaseURL:     baseURL,
 					Status:      "unhealthy",
 					Message:     "stream closed without data",
@@ -351,6 +334,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 				Name:        auth.Provider,
 				Type:        providerType,
 				Label:       auth.Label,
+				Prefix:      auth.Prefix,
 				BaseURL:     baseURL,
 				Status:      "unhealthy",
 				Message:     "health check timeout",
@@ -360,16 +344,43 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 		}
 	}
 
-	// Execute health checks
+	// Build per-model tasks
+	reg := registry.GetGlobalRegistry()
+	type modelTask struct {
+		auth  *coreauth.Auth
+		model *registry.ModelInfo
+	}
+	var tasks []modelTask
+	for _, auth := range targetAuths {
+		models := reg.GetModelsForClient(auth.ID)
+		if len(modelFilterSet) > 0 {
+			filtered := make([]*registry.ModelInfo, 0)
+			for _, model := range models {
+				if _, ok := modelFilterSet[strings.ToLower(model.ID)]; ok {
+					filtered = append(filtered, model)
+				}
+			}
+			models = filtered
+		}
+		if len(models) == 0 {
+			tasks = append(tasks, modelTask{auth: auth, model: nil})
+		} else {
+			for _, m := range models {
+				tasks = append(tasks, modelTask{auth: auth, model: m})
+			}
+		}
+	}
+
+	// Execute health checks (one goroutine per model)
 	if isConcurrent {
-		for _, auth := range targetAuths {
+		for _, t := range tasks {
 			wg.Add(1)
-			go checkProvider(auth)
+			go checkOneModel(t.auth, t.model)
 		}
 	} else {
-		for _, auth := range targetAuths {
+		for _, t := range tasks {
 			wg.Add(1)
-			checkProvider(auth)
+			checkOneModel(t.auth, t.model)
 		}
 	}
 
@@ -404,7 +415,8 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 }
 
 // checkProvidersHealthStream runs health checks and streams each result via SSE.
-// Overall deadline is streamHealthCheckDeadline (30s); any provider not done by then is reported as "timeout".
+// It tests ALL models for each provider (not just the first one).
+// Overall deadline is streamHealthCheckDeadline (30s); any model not done by then is reported as "timeout".
 func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*coreauth.Auth, modelFilterSet map[string]struct{}, timeoutSeconds int) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -419,21 +431,13 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 	streamCtx, streamCancel := context.WithTimeout(usage.WithSkipUsage(c.Request.Context()), streamHealthCheckDeadline)
 	defer streamCancel()
 
-	resultCh := make(chan ProviderHealth, len(targetAuths))
-	completed := make(map[string]bool)
-	var completedMu sync.Mutex
-	var writeMu sync.Mutex
-	sendEvent := func(event string, data interface{}) {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		c.SSEvent(event, data)
-		flusher.Flush()
+	type modelTask struct {
+		auth  *coreauth.Auth
+		model *registry.ModelInfo
 	}
-
-	runOne := func(auth *coreauth.Auth) {
-		providerType := getProviderType(auth)
-		baseURL := authAttribute(auth, "base_url")
-		reg := registry.GetGlobalRegistry()
+	reg := registry.GetGlobalRegistry()
+	var tasks []modelTask
+	for _, auth := range targetAuths {
 		models := reg.GetModelsForClient(auth.ID)
 		if len(modelFilterSet) > 0 {
 			filtered := make([]*registry.ModelInfo, 0)
@@ -444,16 +448,39 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 			}
 			models = filtered
 		}
-		var result ProviderHealth
 		if len(models) == 0 {
-			result = ProviderHealth{
-				ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+			tasks = append(tasks, modelTask{auth: auth, model: nil})
+		} else {
+			for _, m := range models {
+				tasks = append(tasks, modelTask{auth: auth, model: m})
+			}
+		}
+	}
+
+	resultCh := make(chan ProviderHealth, len(tasks))
+	completed := make(map[string]bool)
+	var completedMu sync.Mutex
+	var writeMu sync.Mutex
+	sendEvent := func(event string, data interface{}) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		c.SSEvent(event, data)
+		flusher.Flush()
+	}
+
+	runOneModel := func(auth *coreauth.Auth, testModel *registry.ModelInfo) {
+		providerType := getProviderType(auth)
+		baseURL := authAttribute(auth, "base_url")
+
+		if testModel == nil {
+			resultCh <- ProviderHealth{
+				ID: auth.ID, Name: auth.Provider, Type: providerType,
+				Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 				Status: "unhealthy", Message: "no models available for this provider",
 			}
-			resultCh <- result
 			return
 		}
-		testModel := models[0]
+
 		startTime := time.Now()
 		checkCtx, cancel := context.WithTimeout(streamCtx, time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
@@ -467,33 +494,34 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 		}
 		requestJSON, err := json.Marshal(openAIRequest)
 		if err != nil {
-			result = ProviderHealth{
-				ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
-				Status: "unhealthy", Message: fmt.Sprintf("failed to build request: %v", err), ModelTested: testModel.ID,
+			resultCh <- ProviderHealth{
+				ID: auth.ID, Name: auth.Provider, Type: providerType,
+				Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
+				Status: "unhealthy", Message: fmt.Sprintf("failed to build request: %v", err),
+				ModelTested: testModel.ID,
 			}
-			resultCh <- result
 			return
 		}
 		req := cliproxyexecutor.Request{Model: testModel.ID, Payload: requestJSON, Format: sdktranslator.FormatOpenAI}
 		opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: requestJSON}
 		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, auth, req, opts)
 		if err != nil {
-			result = ProviderHealth{
-				ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+			resultCh <- ProviderHealth{
+				ID: auth.ID, Name: auth.Provider, Type: providerType,
+				Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 				Status: "unhealthy", Message: err.Error(), ModelTested: testModel.ID,
 			}
-			resultCh <- result
 			return
 		}
 		select {
 		case chunk, ok := <-stream:
 			if ok {
 				if chunk.Err != nil {
-					result = ProviderHealth{
-						ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+					resultCh <- ProviderHealth{
+						ID: auth.ID, Name: auth.Provider, Type: providerType,
+						Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 						Status: "unhealthy", Message: chunk.Err.Error(), ModelTested: testModel.ID,
 					}
-					resultCh <- result
 					cancel()
 					go func() { for range stream {} }()
 					return
@@ -501,37 +529,38 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 				latency := time.Since(startTime).Milliseconds()
 				cancel()
 				go func() { for range stream {} }()
-				result = ProviderHealth{
-					ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+				resultCh <- ProviderHealth{
+					ID: auth.ID, Name: auth.Provider, Type: providerType,
+					Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 					Status: "healthy", Latency: latency, ModelTested: testModel.ID,
 				}
-				resultCh <- result
 			} else {
-				result = ProviderHealth{
-					ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+				resultCh <- ProviderHealth{
+					ID: auth.ID, Name: auth.Provider, Type: providerType,
+					Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 					Status: "unhealthy", Message: "stream closed without data", ModelTested: testModel.ID,
 				}
-				resultCh <- result
 			}
 		case <-checkCtx.Done():
-			result = ProviderHealth{
-				ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label, BaseURL: baseURL,
+			resultCh <- ProviderHealth{
+				ID: auth.ID, Name: auth.Provider, Type: providerType,
+				Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
 				Status: "unhealthy", Message: "health check timeout", ModelTested: testModel.ID,
 			}
-			resultCh <- result
 		}
 	}
 
-	for _, auth := range targetAuths {
-		go runOne(auth)
+	for _, t := range tasks {
+		go runOneModel(t.auth, t.model)
 	}
 
 	received := 0
-	for received < len(targetAuths) {
+	for received < len(tasks) {
 		select {
 		case r := <-resultCh:
+			taskKey := r.ID + "::" + r.ModelTested
 			completedMu.Lock()
-			completed[r.ID] = true
+			completed[taskKey] = true
 			completedMu.Unlock()
 			sendEvent("result", r)
 			received++
@@ -540,15 +569,23 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 		}
 	}
 done:
-	for _, auth := range targetAuths {
+	for _, t := range tasks {
+		modelID := ""
+		if t.model != nil {
+			modelID = t.model.ID
+		}
+		taskKey := t.auth.ID + "::" + modelID
 		completedMu.Lock()
-		done := completed[auth.ID]
+		isDone := completed[taskKey]
 		completedMu.Unlock()
-		if !done {
-			providerType := getProviderType(auth)
+		if !isDone {
+			providerType := getProviderType(t.auth)
 			sendEvent("result", ProviderHealth{
-				ID: auth.ID, Name: auth.Provider, Type: providerType, Label: auth.Label,
-				BaseURL: authAttribute(auth, "base_url"), Status: "timeout", Message: "超过30s未完成",
+				ID: t.auth.ID, Name: t.auth.Provider, Type: providerType,
+				Label: t.auth.Label, Prefix: t.auth.Prefix,
+				BaseURL: authAttribute(t.auth, "base_url"),
+				Status: "timeout", Message: "超过30s未完成",
+				ModelTested: modelID,
 			})
 		}
 	}

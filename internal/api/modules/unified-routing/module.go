@@ -38,6 +38,7 @@ type Module struct {
 	routesOnce     sync.Once
 	dataDir        string
 	skipAutoRoutes bool // If true, routes won't be registered in Register()
+	detailedLogger *logging.DetailedRequestLogger
 }
 
 // New creates a new unified routing module.
@@ -75,6 +76,21 @@ func WithDataDir(dir string) Option {
 func WithSkipAutoRoutes() Option {
 	return func(m *Module) {
 		m.skipAutoRoutes = true
+	}
+}
+
+// WithDetailedLogger sets the detailed request logger for recording simulated route logs.
+func WithDetailedLogger(logger *logging.DetailedRequestLogger) Option {
+	return func(m *Module) {
+		m.detailedLogger = logger
+	}
+}
+
+// SetDetailedLogger sets the detailed request logger after module creation.
+func (m *Module) SetDetailedLogger(logger *logging.DetailedRequestLogger) {
+	m.detailedLogger = logger
+	if m.handlers != nil {
+		m.handlers.detailedLogger = logger
 	}
 }
 
@@ -171,6 +187,7 @@ func (m *Module) init(ctx modules.Context) error {
 
 		// Initialize handlers
 		m.handlers = NewHandlers(m.configSvc, m.stateMgr, m.metrics, m.healthChecker, m.authManager, m.engine, m.routeActivity)
+		m.handlers.detailedLogger = m.detailedLogger
 
 		log.Info("[UnifiedRouting] Module initialization complete")
 	})

@@ -491,7 +491,7 @@ run_main() {
         echo ""
         echo -e "${YELLOW}创建临时 Dockerfile...${NC}"
         cat > "$LOCAL_DOCKERFILE" << 'DOCKERFILE_EOF'
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 

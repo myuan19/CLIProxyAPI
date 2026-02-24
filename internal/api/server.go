@@ -316,6 +316,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.unifiedRoutingModule = unifiedrouting.New(
 		unifiedrouting.WithAuthManager(authManager),
 		unifiedrouting.WithSkipAutoRoutes(), // Routes registered later with management auth
+		unifiedrouting.WithDetailedLogger(detailedLogger),
 	)
 	if err := modules.RegisterModule(ctx, s.unifiedRoutingModule); err != nil {
 		log.Errorf("Failed to register Unified Routing module: %v", err)

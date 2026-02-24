@@ -35,6 +35,10 @@ type SDKConfig struct {
 	// Stored with other detailed-log settings; does not affect backend logging behavior.
 	DetailedRequestLogShowRetries bool `yaml:"detailed-request-log-show-retries" json:"detailed-request-log-show-retries"`
 
+	// DetailedRequestLogShowSimulated controls whether simulated route records are shown in the detailed request list.
+	// Stored with other detailed-log settings; does not affect backend logging behavior.
+	DetailedRequestLogShowSimulated bool `yaml:"detailed-request-log-show-simulated" json:"detailed-request-log-show-simulated"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 

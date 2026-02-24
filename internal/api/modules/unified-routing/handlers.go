@@ -2,12 +2,16 @@ package unifiedrouting
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -16,13 +20,14 @@ import (
 
 // Handlers contains all HTTP handlers for unified routing.
 type Handlers struct {
-	configSvc     ConfigService
-	stateMgr      StateManager
-	metrics       MetricsCollector
-	healthChecker HealthChecker
-	authManager   *coreauth.Manager
-	engine        RoutingEngine
-	routeActivity *RouteActivityTracker
+	configSvc      ConfigService
+	stateMgr       StateManager
+	metrics        MetricsCollector
+	healthChecker  HealthChecker
+	authManager    *coreauth.Manager
+	engine         RoutingEngine
+	routeActivity  *RouteActivityTracker
+	detailedLogger *logging.DetailedRequestLogger
 }
 
 // NewHandlers creates a new handlers instance.
@@ -1011,6 +1016,10 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 	startTime := time.Now()
 	traceBuilder := NewTraceBuilder(routeID, route.Name)
 	
+	// Collect detailed log attempts for the simulation
+	var detailedAttempts []logging.DetailedAttempt
+	attemptIdx := 0
+
 	// Follow the exact same logic as ExecuteWithFailover
 	for layerIdx, layer := range pipeline.Layers {
 		h.engine.AdvanceRoundRobin(routeID, layer.Level)
@@ -1045,6 +1054,19 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 				response.Success = true
 				response.FinalTarget = &targetResult
 				response.TotalTimeMs = time.Since(startTime).Milliseconds()
+
+				attemptIdx++
+				detailedAttempts = append(detailedAttempts, logging.DetailedAttempt{
+					Index:       attemptIdx,
+					Timestamp:   time.Now(),
+					UpstreamURL: fmt.Sprintf("simulate://%s/%s", target.CredentialID, target.Model),
+					Method:      "SIMULATE",
+					Auth:        fmt.Sprintf("credential=%s, model=%s", target.CredentialID, target.Model),
+					StatusCode:  200,
+					DurationMs:  0,
+				})
+
+				h.logSimulateRecord(route, &response, startTime, detailedAttempts, "")
 				c.JSON(http.StatusOK, response)
 				return
 			}
@@ -1084,6 +1106,18 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 						"source": "simulate",
 					},
 				})
+
+				attemptIdx++
+				detailedAttempts = append(detailedAttempts, logging.DetailedAttempt{
+					Index:       attemptIdx,
+					Timestamp:   checkStart,
+					UpstreamURL: fmt.Sprintf("simulate://%s/%s", target.CredentialID, target.Model),
+					Method:      "SIMULATE",
+					Auth:        fmt.Sprintf("credential=%s, model=%s", target.CredentialID, target.Model),
+					StatusCode:  0,
+					Error:       errMsg,
+					DurationMs:  targetResult.LatencyMs,
+				})
 				
 				// Continue to next target in this layer
 				continue
@@ -1109,6 +1143,19 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 			response.Success = true
 			response.FinalTarget = &targetResult
 			response.TotalTimeMs = time.Since(startTime).Milliseconds()
+
+			attemptIdx++
+			detailedAttempts = append(detailedAttempts, logging.DetailedAttempt{
+				Index:       attemptIdx,
+				Timestamp:   checkStart,
+				UpstreamURL: fmt.Sprintf("simulate://%s/%s", target.CredentialID, target.Model),
+				Method:      "SIMULATE",
+				Auth:        fmt.Sprintf("credential=%s, model=%s", target.CredentialID, target.Model),
+				StatusCode:  200,
+				DurationMs:  targetResult.LatencyMs,
+			})
+
+			h.logSimulateRecord(route, &response, startTime, detailedAttempts, "")
 			c.JSON(http.StatusOK, response)
 			return
 		}
@@ -1137,5 +1184,42 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 	h.metrics.RecordRequest(trace)
 	
 	response.TotalTimeMs = time.Since(startTime).Milliseconds()
+	h.logSimulateRecord(route, &response, startTime, detailedAttempts, "all layers exhausted")
 	c.JSON(http.StatusOK, response)
+}
+
+// logSimulateRecord creates and logs a DetailedRequestRecord for a simulated route.
+func (h *Handlers) logSimulateRecord(route *Route, resp *SimulateRouteResponse, startTime time.Time, attempts []logging.DetailedAttempt, errMsg string) {
+	if h.detailedLogger == nil || !h.detailedLogger.IsEnabled() {
+		return
+	}
+
+	statusCode := 200
+	if !resp.Success {
+		statusCode = 503
+	}
+
+	idBytes := make([]byte, 4)
+	rand.Read(idBytes)
+	recordID := fmt.Sprintf("sim-%s-%s", startTime.Format("20060102T150405"), hex.EncodeToString(idBytes))
+
+	model := ""
+	if resp.FinalTarget != nil {
+		model = resp.FinalTarget.Model
+	}
+
+	record := &logging.DetailedRequestRecord{
+		ID:              recordID,
+		Timestamp:       startTime,
+		URL:             fmt.Sprintf("/simulate/routes/%s", resp.RouteID),
+		Method:          "SIMULATE",
+		StatusCode:      statusCode,
+		Model:           model,
+		Attempts:        attempts,
+		TotalDurationMs: resp.TotalTimeMs,
+		IsSimulated:     true,
+		Error:           errMsg,
+	}
+
+	h.detailedLogger.LogRecord(record)
 }

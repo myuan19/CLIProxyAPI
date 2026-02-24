@@ -2429,7 +2429,11 @@ func (m *Manager) ExecuteStreamWithAuth(ctx context.Context, auth *Auth, req cli
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 
 	// Execute the stream request directly with the specified auth
-	return executor.ExecuteStream(execCtx, auth, execReq, opts)
+	result, err := executor.ExecuteStream(execCtx, auth, execReq, opts)
+	if err != nil {
+		return nil, err
+	}
+	return result.Chunks, nil
 }
 
 // ExecuteWithAuth performs a non-streaming execution using a specific auth directly.
