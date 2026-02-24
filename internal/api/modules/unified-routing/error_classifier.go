@@ -90,6 +90,11 @@ func classifyHTTPStatus(code int, err error) ErrorClass {
 		if isOverloadMessage(err.Error()) {
 			return ErrorClassRetryable
 		}
+		// Some providers return 400 for token/auth problems that a different
+		// credential would fix. Retry on the next target.
+		if isTokenError(err.Error()) {
+			return ErrorClassRetryable
+		}
 		return ErrorClassNonRetryable
 
 	case code == 413: // Payload too large
@@ -159,6 +164,35 @@ func classifyByMessage(err error) ErrorClass {
 
 	// Default: assume retryable to avoid silently dropping requests.
 	return ErrorClassRetryable
+}
+
+// isTokenError returns true if the 400 error message indicates an
+// authentication / token problem that a different credential could fix.
+func isTokenError(msg string) bool {
+	msg = strings.ToLower(msg)
+	tokenKeywords := []string{
+		"invalid token",
+		"token expired",
+		"token invalid",
+		"invalid api key",
+		"invalid_api_key",
+		"incorrect api key",
+		"invalid authentication",
+		"authentication_error",
+		"invalid x-api-key",
+		"api key not valid",
+		"invalid bearer token",
+		"expired token",
+		"expired key",
+		"invalid credential",
+		"invalid authorization",
+	}
+	for _, kw := range tokenKeywords {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // isOverloadMessage returns true if the message suggests the failure

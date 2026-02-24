@@ -176,6 +176,7 @@ type RequestTrace struct {
 	Status         TraceStatus    `json:"status"`
 	TotalLatencyMs int64          `json:"total_latency_ms"`
 	Attempts       []AttemptTrace `json:"attempts"`
+	IsSimulated    bool           `json:"is_simulated,omitempty"`
 }
 
 // TraceStatus defines the status of a trace.

@@ -2,6 +2,7 @@ package unifiedrouting
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -490,10 +491,10 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 			}
 			target := availableTargets[idx]
 
-			auth := e.findAuth(target.CredentialID)
-			if auth == nil {
+			auth, authErr := e.findAuth(target.CredentialID)
+			if authErr != nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed("credential not found")
+					Failed(authErr.Error())
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
@@ -610,10 +611,10 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			}
 			target := availableTargets[idx]
 
-			auth := e.findAuth(target.CredentialID)
-			if auth == nil {
+			auth, authErr := e.findAuth(target.CredentialID)
+			if authErr != nil {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed("credential not found")
+					Failed(authErr.Error())
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
@@ -862,18 +863,21 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 	return nil, &AllTargetsExhaustedError{RouteID: decision.RouteID}
 }
 
-func (e *DefaultRoutingEngine) findAuth(credentialID string) *coreauth.Auth {
+func (e *DefaultRoutingEngine) findAuth(credentialID string) (*coreauth.Auth, error) {
 	if e.authManager == nil {
-		return nil
+		return nil, errors.New("auth manager not initialized")
 	}
 
 	auths := e.authManager.List()
 	for _, auth := range auths {
 		if auth.ID == credentialID {
-			return auth
+			if auth.Disabled {
+				return nil, errors.New("credential disabled")
+			}
+			return auth, nil
 		}
 	}
-	return nil
+	return nil, errors.New("credential not found")
 }
 
 // Error types

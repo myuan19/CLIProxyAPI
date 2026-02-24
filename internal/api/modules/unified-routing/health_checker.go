@@ -226,6 +226,12 @@ func (h *DefaultHealthChecker) performHealthCheck(ctx context.Context, target *T
 		return result
 	}
 
+	if targetAuth.Disabled {
+		result.Status = "unhealthy"
+		result.Message = "credential disabled"
+		return result
+	}
+
 	// Build minimal request for health check
 	openAIRequest := map[string]interface{}{
 		"model": target.Model,

@@ -1014,7 +1014,7 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 	}
 	
 	startTime := time.Now()
-	traceBuilder := NewTraceBuilder(routeID, route.Name, "")
+	traceBuilder := NewTraceBuilder(routeID, route.Name, "").SetSimulated()
 	
 	// Collect detailed log attempts for the simulation
 	var detailedAttempts []logging.DetailedAttempt

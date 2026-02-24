@@ -275,6 +275,12 @@ func NewTraceBuilder(routeID, routeName, inputModel string) *TraceBuilder {
 	}
 }
 
+// SetSimulated marks the trace as originating from a simulated request.
+func (b *TraceBuilder) SetSimulated() *TraceBuilder {
+	b.trace.IsSimulated = true
+	return b
+}
+
 // AddAttempt adds an attempt to the trace.
 func (b *TraceBuilder) AddAttempt(layer int, targetID, credentialID, model string) *AttemptBuilder {
 	attempt := AttemptTrace{
