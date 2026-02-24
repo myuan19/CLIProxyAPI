@@ -38,6 +38,10 @@ type RoutingEngine interface {
 
 	// SelectTarget selects the next target from a layer based on the load balancing strategy.
 	SelectTarget(ctx context.Context, routeID string, layer *Layer) (*Target, error)
+
+	// AdvanceRoundRobin increments the round-robin counter for a layer.
+	// Call once per new request before the retry loop.
+	AdvanceRoundRobin(routeID string, level int)
 }
 
 // RoutingDecision represents the decision made by the routing engine.
@@ -220,8 +224,24 @@ func (e *DefaultRoutingEngine) Reload(ctx context.Context) error {
 }
 
 // SelectTarget selects the next target from a layer based on the strategy.
+// AdvanceRoundRobin increments the round-robin counter for a layer.
+// Call once per new request before entering the retry loop;
+// SelectTarget itself reads the counter without incrementing.
+func (e *DefaultRoutingEngine) AdvanceRoundRobin(routeID string, level int) {
+	key := fmt.Sprintf("%s:%d", routeID, level)
+
+	e.mu.Lock()
+	counter, ok := e.rrCounters[key]
+	if !ok {
+		counter = &atomic.Uint64{}
+		e.rrCounters[key] = counter
+	}
+	e.mu.Unlock()
+
+	counter.Add(1)
+}
+
 func (e *DefaultRoutingEngine) SelectTarget(ctx context.Context, routeID string, layer *Layer) (*Target, error) {
-	// Get available targets
 	availableTargets := make([]Target, 0)
 	for _, target := range layer.Targets {
 		if !target.Enabled {
@@ -238,7 +258,6 @@ func (e *DefaultRoutingEngine) SelectTarget(ctx context.Context, routeID string,
 		return nil, &NoAvailableTargetsError{Layer: layer.Level}
 	}
 
-	// Select based on strategy
 	var selected *Target
 	switch layer.Strategy {
 	case StrategyRoundRobin, "":
@@ -269,7 +288,7 @@ func (e *DefaultRoutingEngine) selectRoundRobin(routeID string, level int, targe
 	}
 	e.mu.Unlock()
 
-	idx := counter.Add(1) - 1
+	idx := counter.Load() - 1
 	return &targets[int(idx)%len(targets)]
 }
 
@@ -294,7 +313,7 @@ func (e *DefaultRoutingEngine) selectWeightedRoundRobin(routeID string, level in
 	}
 	e.mu.Unlock()
 
-	idx := int(counter.Add(1)-1) % totalWeight
+	idx := int(counter.Load()-1) % totalWeight
 
 	// Find the target
 	cumulative := 0
@@ -343,7 +362,7 @@ func (e *DefaultRoutingEngine) selectLeastConnections(ctx context.Context, targe
 // failoverFirstChunkTimeout is the maximum time to wait for the first stream chunk
 // during failover. If the target doesn't return any data within this period,
 // it is considered unresponsive and the next target is tried.
-const failoverFirstChunkTimeout = 10 * time.Second
+const failoverFirstChunkTimeout = 15 * time.Second
 
 // failoverNonStreamTimeout is the maximum time for a single non-streaming request
 // attempt during failover. Non-streaming requests must receive the full response
@@ -370,6 +389,8 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 
 	// Try each layer in order
 	for layerIdx, layer := range decision.Pipeline.Layers {
+		e.AdvanceRoundRobin(decision.RouteID, layer.Level)
+
 		// Keep trying targets in this layer until no available targets remain
 		// SelectTarget automatically excludes cooling-down targets
 		for {
@@ -411,10 +432,8 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 			errClass := ClassifyError(err)
 
 			if errClass == ErrorClassNonRetryable {
-				// Request-level problem — retrying on a different target will
-				// produce the same failure. Return immediately without cooldown.
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(err.Error())
+					Failed(err.Error(), attemptLatency)
 				e.metrics.RecordEvent(&RoutingEvent{
 					Type:    EventNonRetryableError,
 					RouteID: decision.RouteID,
@@ -432,7 +451,7 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 			// Retryable (node-level) failure — cooldown this target and try next
 			e.stateMgr.RecordFailure(ctx, target.ID, err.Error())
 			traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-				Failed(err.Error())
+				Failed(err.Error(), attemptLatency)
 			e.stateMgr.StartCooldownTimed(ctx, target.ID)
 			e.healthChecker.ScheduleTargetCheck(target.ID)
 			e.metrics.RecordEvent(&RoutingEvent{
@@ -494,6 +513,8 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 
 	// Try each layer in order
 	for layerIdx, layer := range decision.Pipeline.Layers {
+		e.AdvanceRoundRobin(decision.RouteID, layer.Level)
+
 		// Keep trying targets in this layer until no available targets remain
 		for {
 			target, err := e.SelectTarget(ctx, decision.RouteID, &layer)
@@ -542,9 +563,9 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					errClass := ClassifyError(res.err)
 
 					if errClass == ErrorClassNonRetryable {
-						// Request-level problem — return immediately without cooldown
+						connLatency := time.Since(attemptStart).Milliseconds()
 						traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-							Failed(res.err.Error())
+							Failed(res.err.Error(), connLatency)
 						e.metrics.RecordEvent(&RoutingEvent{
 							Type:    EventNonRetryableError,
 							RouteID: decision.RouteID,
@@ -560,9 +581,10 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					}
 
 					// Retryable — cooldown and try next target
+					connLatency := time.Since(attemptStart).Milliseconds()
 					e.stateMgr.RecordFailure(ctx, target.ID, res.err.Error())
 					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-						Failed(res.err.Error())
+						Failed(res.err.Error(), connLatency)
 					e.stateMgr.StartCooldownTimed(ctx, target.ID)
 					e.healthChecker.ScheduleTargetCheck(target.ID)
 					e.metrics.RecordEvent(&RoutingEvent{
@@ -583,12 +605,11 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			}
 
 			if connTimedOut {
-				// Connection was not established within the timeout.
 				attemptLatency := time.Since(attemptStart).Milliseconds()
 				errMsg := fmt.Sprintf("connection timeout (%s)", failoverFirstChunkTimeout)
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(errMsg)
+					Failed(errMsg, attemptLatency)
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
@@ -621,12 +642,11 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			case firstChunk, ok = <-chunks:
 				firstChunkTimer.Stop()
 			case <-firstChunkTimer.C:
-				// Target did not return any data within the timeout
 				attemptLatency := time.Since(attemptStart).Milliseconds()
 				errMsg := fmt.Sprintf("first chunk timeout (%s)", failoverFirstChunkTimeout)
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(errMsg)
+					Failed(errMsg, attemptLatency)
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
@@ -647,11 +667,10 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 			}
 
 			if !ok {
-				// Channel closed immediately without any data - treat as failure
 				attemptLatency := time.Since(attemptStart).Milliseconds()
 				e.stateMgr.RecordFailure(ctx, target.ID, "stream closed without data")
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed("stream closed without data")
+					Failed("stream closed without data", attemptLatency)
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{
@@ -677,10 +696,11 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 					}
 				}()
 
+				attemptLatency := time.Since(attemptStart).Milliseconds()
+
 				if chunkErrClass == ErrorClassNonRetryable {
-					// Request-level problem — return immediately without cooldown
 					traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-						Failed(errMsg)
+						Failed(errMsg, attemptLatency)
 					e.metrics.RecordEvent(&RoutingEvent{
 						Type:    EventNonRetryableError,
 						RouteID: decision.RouteID,
@@ -696,10 +716,9 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 				}
 
 				// Retryable — cooldown and try next target
-				attemptLatency := time.Since(attemptStart).Milliseconds()
 				e.stateMgr.RecordFailure(ctx, target.ID, errMsg)
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(errMsg)
+					Failed(errMsg, attemptLatency)
 				e.stateMgr.StartCooldownTimed(ctx, target.ID)
 				e.healthChecker.ScheduleTargetCheck(target.ID)
 				e.metrics.RecordEvent(&RoutingEvent{

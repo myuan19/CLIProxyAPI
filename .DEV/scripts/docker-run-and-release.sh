@@ -11,12 +11,12 @@
 #
 # 1. 创建临时配置文件
 #    - 影响: 在项目目录创建 config.test.yaml（如已存在会被覆盖）
-#    - 位置: CLIProxyAPI/config.test.yaml
+#    - 位置: CLIProxyAPI/.DEV/config.test.yaml
 #    - 清理: 脚本结束时自动删除
 #
 # 2. 创建临时目录
 #    - 影响: 创建 auths-test 和 logs-test 目录
-#    - 位置: CLIProxyAPI/auths-test, CLIProxyAPI/logs-test
+#    - 位置: CLIProxyAPI/auths-test, CLIProxyAPI/.DEV/logs-test
 #    - 清理: 脚本结束时自动删除
 #
 # 3. 构建 Docker 镜像
@@ -153,17 +153,16 @@ FRONTEND_DIST_HTML="$FRONTEND_DIR/dist/index.html"
 CONTAINER_HTML_PATH="/CLIProxyAPI/static/management.html"
 
 # 临时文件路径（仅当 USE_SYSTEM_CONFIG=false 时使用）
-TEST_CONFIG_FILE="$PROJECT_ROOT/config.test.yaml"
+TEST_CONFIG_FILE="$PROJECT_ROOT/.DEV/config.test.yaml"
 TEST_AUTH_DIR="$PROJECT_ROOT/auths-test"
-TEST_LOG_DIR="$PROJECT_ROOT/logs-test"
-LOCAL_DOCKERFILE="$PROJECT_ROOT/Dockerfile.local"
-BACKEND_STATIC_DIR="$PROJECT_ROOT/static"
+TEST_LOG_DIR="$PROJECT_ROOT/.DEV/logs-test"
+LOCAL_DOCKERFILE="$PROJECT_ROOT/.DEV/Dockerfile.local"
+BACKEND_STATIC_DIR="$PROJECT_ROOT/.DEV/static"
 BACKEND_MANAGEMENT_HTML="$BACKEND_STATIC_DIR/management.html"
 
 # 系统目录路径（使用顶部配置的变量）
 SYSTEM_AUTH_DIR="$SYSTEM_AUTH_DIR_PATH"
-SYSTEM_LOG_DIR="$PROJECT_ROOT/logs"
-
+SYSTEM_LOG_DIR="$PROJECT_ROOT/.DEV/logs"
 # 完整镜像名称
 FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}"
 
@@ -521,7 +520,7 @@ COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
 
 # 复制本地构建的前端文件
-COPY static/management.html /CLIProxyAPI/static/management.html
+COPY .DEV/static/management.html /CLIProxyAPI/static/management.html
 
 WORKDIR /CLIProxyAPI
 
@@ -547,11 +546,11 @@ DOCKERFILE_EOF
     pushd "$PROJECT_ROOT" > /dev/null
 
     if [ "$USE_LOCAL_FRONTEND" = "true" ]; then
-        local build_cmd="docker build --network=host -t $FULL_IMAGE_NAME -f Dockerfile.local --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --build-arg BUILD_DATE=$BUILD_DATE ."
+        local build_cmd="docker build --network=host -t $FULL_IMAGE_NAME -f .DEV/Dockerfile.local --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --build-arg BUILD_DATE=$BUILD_DATE ."
         write_command "$build_cmd" "构建 Docker 镜像（使用本地前端，约 1-5 分钟）"
 
         if ! docker build --network=host -t "$FULL_IMAGE_NAME" \
-            -f Dockerfile.local \
+            -f .DEV/Dockerfile.local \
             --build-arg "VERSION=$VERSION" \
             --build-arg "COMMIT=$COMMIT" \
             --build-arg "BUILD_DATE=$BUILD_DATE" \
@@ -607,11 +606,8 @@ DOCKERFILE_EOF
             return 1
         fi
 
-        # 从配置文件读取端口
-        container_port=$(grep -E '^port:\s*[0-9]+' "$system_config_file" | head -1 | sed 's/^port:\s*//' | tr -d '[:space:]')
-        if [ -z "$container_port" ]; then
-            container_port=8317  # 默认端口
-        fi
+        # 使用 TEST_PORT 作为容器端口（与生产端口隔离）
+        container_port=$TEST_PORT
 
         # 从配置文件读取第一个 API Key（用于健康检查）
         api_key_for_health_check=$(grep -A1 '^api-keys:' "$system_config_file" | tail -1 | sed 's/^\s*-\s*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | tr -d '[:space:]')
@@ -630,6 +626,9 @@ DOCKERFILE_EOF
         local config_content
         config_content=$(<"$system_config_file")
 
+        # 替换端口为 TEST_PORT（避免与正在运行的服务冲突）
+        config_content=$(echo "$config_content" | sed "s|^port:.*|port: $container_port|")
+
         # 替换 auth-dir 为容器内路径（因为要挂载真实目录到容器内）
         config_content=$(echo "$config_content" | sed 's|^auth-dir:.*|auth-dir: "/root/.cli-proxy-api"|')
 
@@ -643,7 +642,7 @@ DOCKERFILE_EOF
         echo "$config_content" > "$TEST_CONFIG_FILE"
 
         write_success "测试配置已创建"
-        echo -e "  ${GRAY}已修改: auth-dir=/root/.cli-proxy-api, secret-key=$management_key, allow-remote=true${NC}"
+        echo -e "  ${GRAY}已修改: port=$container_port, auth-dir=/root/.cli-proxy-api, secret-key=$management_key, allow-remote=true${NC}"
 
         config_file_to_mount="$TEST_CONFIG_FILE"
         auth_dir_to_mount="$SYSTEM_AUTH_DIR"   # 挂载真实认证目录
@@ -671,7 +670,7 @@ DOCKERFILE_EOF
         # ========================================
         # 不使用系统配置：使用临时目录
         # ========================================
-        container_port=8317
+        container_port=$TEST_PORT
         api_key_for_health_check="$TEST_API_KEY"  # 使用测试 API Key
 
         # 创建最小化测试配置
@@ -727,6 +726,26 @@ EOF
         docker rm -f "$TEST_CONTAINER_NAME" 2>/dev/null || true
     fi
 
+    # 检查端口是否被占用
+    echo ""
+    echo -e "${CYAN}检查端口 $container_port 是否可用...${NC}"
+    local port_in_use=""
+    if command -v ss &>/dev/null; then
+        port_in_use=$(ss -tlnp 2>/dev/null | grep ":${container_port}\b" || true)
+    elif command -v netstat &>/dev/null; then
+        port_in_use=$(netstat -tlnp 2>/dev/null | grep ":${container_port}\b" || true)
+    elif command -v lsof &>/dev/null; then
+        port_in_use=$(lsof -i ":${container_port}" -sTCP:LISTEN 2>/dev/null || true)
+    fi
+    if [ -n "$port_in_use" ]; then
+        write_error "端口 $container_port 已被占用！"
+        echo -e "  ${GRAY}${port_in_use}${NC}"
+        echo ""
+        echo -e "${YELLOW}提示: 请停止占用端口的进程，或修改脚本中的 TEST_PORT 变量${NC}"
+        return 1
+    fi
+    write_success "端口 $container_port 可用"
+
     # 根据配置决定描述信息
     local config_desc
     local frontend_desc
@@ -758,10 +777,57 @@ EOF
     echo -e "  ${GRAY}配置来源: $config_desc${NC}"
     echo -e "  ${GRAY}管理密钥: $management_key${NC}"
 
-    echo -e "${GREEN}✓ 测试容器已启动${NC}"
-
     # 标记容器已启动（用于 Ctrl+C 清理判断）
     CONTAINER_STARTED=true
+
+    # 验证容器启动成功
+    echo ""
+    echo -e "${CYAN}验证容器启动...${NC}"
+    local startup_ok=false
+    for i in 1 2 3 4 5; do
+        sleep 1
+        local cstate
+        cstate=$(docker inspect -f '{{.State.Running}}' "$TEST_CONTAINER_NAME" 2>/dev/null || echo "false")
+        if [ "$cstate" = "true" ]; then
+            startup_ok=true
+            break
+        fi
+        echo -e "  ${GRAY}等待容器启动... (${i}s)${NC}"
+    done
+
+    if [ "$startup_ok" != "true" ]; then
+        write_error "容器启动失败！"
+        echo ""
+        echo -e "${YELLOW}容器日志:${NC}"
+        docker logs "$TEST_CONTAINER_NAME" 2>&1 | tail -30
+        echo ""
+        local exit_code
+        exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$TEST_CONTAINER_NAME" 2>/dev/null || echo "?")
+        echo -e "${RED}容器退出码: $exit_code${NC}"
+        return 1
+    fi
+
+    # 额外等待并检查端口是否在监听（容器运行 ≠ 服务就绪）
+    local port_ready=false
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        local listen_check=""
+        if command -v ss &>/dev/null; then
+            listen_check=$(ss -tlnp 2>/dev/null | grep ":${container_port}\b" || true)
+        elif command -v netstat &>/dev/null; then
+            listen_check=$(netstat -tlnp 2>/dev/null | grep ":${container_port}\b" || true)
+        fi
+        if [ -n "$listen_check" ]; then
+            port_ready=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$port_ready" = "true" ]; then
+        write_success "容器已启动，端口 $container_port 正在监听"
+    else
+        write_warning "容器已启动，但端口 $container_port 暂未监听（服务可能仍在初始化）"
+    fi
 
     # ========================================
     # 交互式暂停：允许手动测试

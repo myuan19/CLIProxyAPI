@@ -95,7 +95,7 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 			if model != "" {
 				record.Model = model
 			}
-			record.RequestBody = truncateString(string(requestBody), 50000)
+			record.RequestBody = string(requestBody)
 		}
 
 		record.RequestHeaders = requestHeaders
@@ -120,7 +120,7 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 		record.ResponseHeaders = responseHeaders
 
 		if detailedCapture.body.Len() > 0 {
-			record.ResponseBody = truncateString(detailedCapture.body.String(), 50000)
+			record.ResponseBody = detailedCapture.body.String()
 		}
 
 		// 重试部分：从 Gin 上下文中记录各次上游请求/响应（由 executor 在 DetailedRequestLog 开启时写入）
@@ -148,11 +148,12 @@ type detailedResponseCapture struct {
 	statusCode int
 }
 
+const detailedCaptureMaxBytes = 10 * 1024 * 1024 // 10 MB
+
 func (w *detailedResponseCapture) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
-	// Limit capture to avoid memory issues
-	if w.body.Len() < 100000 {
-		remaining := 100000 - w.body.Len()
+	if w.body.Len() < detailedCaptureMaxBytes {
+		remaining := detailedCaptureMaxBytes - w.body.Len()
 		if len(data) > remaining {
 			w.body.Write(data[:remaining])
 		} else {
@@ -164,8 +165,8 @@ func (w *detailedResponseCapture) Write(data []byte) (int, error) {
 
 func (w *detailedResponseCapture) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
-	if w.body.Len() < 100000 {
-		remaining := 100000 - w.body.Len()
+	if w.body.Len() < detailedCaptureMaxBytes {
+		remaining := detailedCaptureMaxBytes - w.body.Len()
 		if len(data) > remaining {
 			w.body.WriteString(data[:remaining])
 		} else {
@@ -250,10 +251,10 @@ func extractAttempts(c *gin.Context) []logging.DetailedAttempt {
 			Method:          a.Method,
 			Auth:            a.Auth,
 			RequestHeaders:  a.RequestHeaders,
-			RequestBody:     truncateString(a.RequestBody, 30000),
+			RequestBody:     a.RequestBody,
 			StatusCode:      a.StatusCode,
 			ResponseHeaders: a.ResponseHeaders,
-			ResponseBody:    truncateString(a.ResponseBody, 30000),
+			ResponseBody:    a.ResponseBody,
 			Error:           a.Error,
 		})
 	}
@@ -454,10 +455,3 @@ func parseIntValue(s string) int {
 	return n
 }
 
-// truncateString truncates a string to the given maximum length.
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "...[truncated]"
-}

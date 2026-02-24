@@ -62,6 +62,41 @@ type DetailedRequestRecord struct {
 	Error           string              `json:"error,omitempty"`
 }
 
+// DetailedRequestSummary is a lightweight projection of DetailedRequestRecord
+// returned by the list endpoint so the frontend doesn't have to download full bodies.
+type DetailedRequestSummary struct {
+	ID              string `json:"id"`
+	Timestamp       time.Time `json:"timestamp"`
+	APIKey          string `json:"api_key"`
+	APIKeyHash      string `json:"api_key_hash"`
+	URL             string `json:"url"`
+	Method          string `json:"method"`
+	StatusCode      int    `json:"status_code"`
+	Model           string `json:"model,omitempty"`
+	TotalDurationMs int64  `json:"total_duration_ms"`
+	IsStreaming     bool   `json:"is_streaming"`
+	Error           string `json:"error,omitempty"`
+	AttemptCount    int    `json:"attempt_count"`
+}
+
+// ToSummary converts a full record to a lightweight summary.
+func (r *DetailedRequestRecord) ToSummary() DetailedRequestSummary {
+	return DetailedRequestSummary{
+		ID:              r.ID,
+		Timestamp:       r.Timestamp,
+		APIKey:          r.APIKey,
+		APIKeyHash:      r.APIKeyHash,
+		URL:             r.URL,
+		Method:          r.Method,
+		StatusCode:      r.StatusCode,
+		Model:           r.Model,
+		TotalDurationMs: r.TotalDurationMs,
+		IsStreaming:     r.IsStreaming,
+		Error:           r.Error,
+		AttemptCount:    len(r.Attempts),
+	}
+}
+
 // DetailedAttempt represents a single upstream attempt (initial or retry).
 type DetailedAttempt struct {
 	Index           int                 `json:"index"`
@@ -415,6 +450,20 @@ func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedReq
 	}
 
 	return filtered, total, apiKeys, nil
+}
+
+// ReadRecordSummaries is like ReadRecords but returns lightweight summaries
+// (no bodies, headers, or attempt details) for the list endpoint.
+func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter) ([]DetailedRequestSummary, int, []string, error) {
+	records, total, apiKeys, err := dl.ReadRecords(filter)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	summaries := make([]DetailedRequestSummary, len(records))
+	for i := range records {
+		summaries[i] = records[i].ToSummary()
+	}
+	return summaries, total, apiKeys, nil
 }
 
 // ReadRecordByID reads a single record by its ID, checking individual files first,

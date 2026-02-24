@@ -341,10 +341,13 @@ func (b *AttemptBuilder) Success(latencyMs int64) *TraceBuilder {
 	return &TraceBuilder{trace: b.trace}
 }
 
-// Failed marks the attempt as failed.
-func (b *AttemptBuilder) Failed(err string) *TraceBuilder {
+// Failed marks the attempt as failed with optional latency.
+func (b *AttemptBuilder) Failed(err string, latencyMs ...int64) *TraceBuilder {
 	b.attempt.Status = AttemptStatusFailed
 	b.attempt.Error = err
+	if len(latencyMs) > 0 {
+		b.attempt.LatencyMs = latencyMs[0]
+	}
 	return &TraceBuilder{trace: b.trace}
 }
 

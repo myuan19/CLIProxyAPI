@@ -133,14 +133,14 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 		}
 	}
 
-	records, total, apiKeys, err := h.detailedLogger.ReadRecords(filter)
+	summaries, total, apiKeys, err := h.detailedLogger.ReadRecordSummaries(filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read records: %v", err)})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"records":  records,
+		"records":  summaries,
 		"total":    total,
 		"offset":   filter.Offset,
 		"limit":    filter.Limit,

@@ -359,6 +359,121 @@ func (s *MemoryStateStore) DeleteTargetState(ctx context.Context, targetID strin
 	return nil
 }
 
+// ================== File-based State Store ==================
+
+// FileStateStore implements StateStore with JSON file persistence.
+// Each target's state is stored as {targetID}.json in the state directory.
+// An in-memory cache is used for fast reads; writes go to both cache and disk.
+type FileStateStore struct {
+	mu       sync.RWMutex
+	states   map[string]*TargetState
+	stateDir string
+}
+
+// NewFileStateStore creates a new file-based state store that persists to disk.
+// On creation it loads any existing state files from stateDir.
+func NewFileStateStore(stateDir string) (*FileStateStore, error) {
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
+	}
+
+	s := &FileStateStore{
+		states:   make(map[string]*TargetState),
+		stateDir: stateDir,
+	}
+
+	if err := s.loadAll(); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func (s *FileStateStore) stateFilePath(targetID string) string {
+	safe := strings.ReplaceAll(targetID, "/", "_")
+	return filepath.Join(s.stateDir, safe+".json")
+}
+
+func (s *FileStateStore) loadAll() error {
+	entries, err := os.ReadDir(s.stateDir)
+	if err != nil {
+		return fmt.Errorf("failed to read state directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.stateDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var state TargetState
+		if err := json.Unmarshal(data, &state); err != nil || state.TargetID == "" {
+			continue
+		}
+		// Reset transient runtime fields on load — cooldowns are invalid after restart.
+		if state.Status == StatusCooling || state.Status == StatusChecking {
+			state.Status = StatusHealthy
+			state.CooldownEndsAt = nil
+		}
+		state.ActiveConnections = 0
+		state.RecalcStats()
+		s.states[state.TargetID] = &state
+	}
+	return nil
+}
+
+func (s *FileStateStore) persist(state *TargetState) {
+	data, err := json.MarshalIndent(state, "", "    ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(s.stateFilePath(state.TargetID), data, 0644)
+}
+
+func (s *FileStateStore) GetTargetState(ctx context.Context, targetID string) (*TargetState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	state, ok := s.states[targetID]
+	if !ok {
+		return &TargetState{
+			TargetID: targetID,
+			Status:   StatusHealthy,
+		}, nil
+	}
+	return state, nil
+}
+
+func (s *FileStateStore) SetTargetState(ctx context.Context, state *TargetState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.states[state.TargetID] = state
+	s.persist(state)
+	return nil
+}
+
+func (s *FileStateStore) ListTargetStates(ctx context.Context) ([]*TargetState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	states := make([]*TargetState, 0, len(s.states))
+	for _, state := range s.states {
+		states = append(states, state)
+	}
+	return states, nil
+}
+
+func (s *FileStateStore) DeleteTargetState(ctx context.Context, targetID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.states, targetID)
+	_ = os.Remove(s.stateFilePath(targetID))
+	return nil
+}
+
 // ================== File-based Metrics Store ==================
 
 // FileMetricsStore implements MetricsStore using file-based storage.

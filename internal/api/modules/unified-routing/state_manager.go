@@ -187,8 +187,7 @@ func (m *DefaultStateManager) RecordSuccess(ctx context.Context, targetID string
 	state.ConsecutiveFailures = 0
 	state.LastSuccessAt = &now
 	state.CooldownEndsAt = nil
-	state.TotalRequests++
-	state.SuccessfulRequests++
+	state.PushResult(true)
 
 	_ = m.store.SetTargetState(ctx, state)
 }
@@ -206,7 +205,7 @@ func (m *DefaultStateManager) RecordFailure(ctx context.Context, targetID string
 	state.ConsecutiveFailures++
 	state.LastFailureAt = &now
 	state.LastFailureReason = reason
-	state.TotalRequests++
+	state.PushResult(false)
 
 	_ = m.store.SetTargetState(ctx, state)
 }

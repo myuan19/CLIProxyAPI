@@ -140,11 +140,19 @@ func (m *Module) init(ctx modules.Context) error {
 			return
 		}
 		m.configStore = configStore
-		m.stateStore = NewMemoryStateStore()
 
 		// Use the shared logging module to resolve the logs directory
 		baseLogsDir := logging.ResolveLogDirectory(ctx.Config)
 		logsDir := filepath.Join(baseLogsDir, "unified-routing")
+
+		stateDir := filepath.Join(logsDir, "state")
+		stateStore, err := NewFileStateStore(stateDir)
+		if err != nil {
+			initErr = err
+			return
+		}
+		m.stateStore = stateStore
+		log.Infof("[UnifiedRouting] State directory: %s", stateDir)
 		metricsStore, err := NewFileMetricsStore(logsDir, 100) // 100MB max for traces
 		if err != nil {
 			initErr = err
@@ -162,7 +170,7 @@ func (m *Module) init(ctx modules.Context) error {
 		m.engine = NewRoutingEngine(m.configSvc, m.stateMgr, m.metrics, m.authManager, m.routeActivity, m.healthChecker)
 
 		// Initialize handlers
-		m.handlers = NewHandlers(m.configSvc, m.stateMgr, m.metrics, m.healthChecker, m.authManager, m.engine)
+		m.handlers = NewHandlers(m.configSvc, m.stateMgr, m.metrics, m.healthChecker, m.authManager, m.engine, m.routeActivity)
 
 		log.Info("[UnifiedRouting] Module initialization complete")
 	})

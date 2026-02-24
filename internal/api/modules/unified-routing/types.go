@@ -88,6 +88,8 @@ const (
 // TargetState represents the runtime state of a target (in-memory entity).
 // When Status is cooling: CooldownEndsAt != nil means timed cooling (next check at this time);
 // CooldownEndsAt == nil means untimed cooling (no periodic check until traffic triggers one).
+const RecentResultsMax = 20
+
 type TargetState struct {
 	TargetID            string       `json:"target_id"`
 	Status              TargetStatus `json:"status"`
@@ -97,8 +99,30 @@ type TargetState struct {
 	LastFailureAt       *time.Time   `json:"last_failure_at,omitempty"`
 	LastFailureReason   string       `json:"last_failure_reason,omitempty"`
 	ActiveConnections   int64        `json:"active_connections"`
+	RecentResults       []bool       `json:"recent_results"`
 	TotalRequests       int64        `json:"total_requests"`
 	SuccessfulRequests  int64        `json:"successful_requests"`
+}
+
+// RecalcStats recomputes TotalRequests and SuccessfulRequests from RecentResults.
+func (s *TargetState) RecalcStats() {
+	s.TotalRequests = int64(len(s.RecentResults))
+	var ok int64
+	for _, r := range s.RecentResults {
+		if r {
+			ok++
+		}
+	}
+	s.SuccessfulRequests = ok
+}
+
+// PushResult appends a result to the rolling window, trimming to RecentResultsMax.
+func (s *TargetState) PushResult(success bool) {
+	s.RecentResults = append(s.RecentResults, success)
+	if len(s.RecentResults) > RecentResultsMax {
+		s.RecentResults = s.RecentResults[len(s.RecentResults)-RecentResultsMax:]
+	}
+	s.RecalcStats()
 }
 
 // TargetStatus defines the status of a target.

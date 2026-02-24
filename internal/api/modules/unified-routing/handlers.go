@@ -22,6 +22,7 @@ type Handlers struct {
 	healthChecker HealthChecker
 	authManager   *coreauth.Manager
 	engine        RoutingEngine
+	routeActivity *RouteActivityTracker
 }
 
 // NewHandlers creates a new handlers instance.
@@ -32,6 +33,7 @@ func NewHandlers(
 	healthChecker HealthChecker,
 	authManager *coreauth.Manager,
 	engine RoutingEngine,
+	routeActivity *RouteActivityTracker,
 ) *Handlers {
 	return &Handlers{
 		configSvc:     configSvc,
@@ -40,6 +42,7 @@ func NewHandlers(
 		healthChecker: healthChecker,
 		authManager:   authManager,
 		engine:        engine,
+		routeActivity: routeActivity,
 	}
 }
 
@@ -963,7 +966,7 @@ type SimulateTargetResult struct {
 	Model        string `json:"model"`
 	Status       string `json:"status"` // "success", "failed", "skipped"
 	Message      string `json:"message,omitempty"`
-	LatencyMs    int64  `json:"latency_ms,omitempty"`
+	LatencyMs    int64  `json:"latency_ms"`
 }
 
 // SimulateRoute simulates the routing process for a specific route.
@@ -995,6 +998,10 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 		return
 	}
 	
+	// Same as ExecuteWithFailover: mark route activity and trigger untimed cooling checks
+	h.routeActivity.Mark(routeID)
+	go h.healthChecker.TriggerCheckUntimedCoolingTargets(ctx, routeID)
+
 	response := SimulateRouteResponse{
 		RouteID:   routeID,
 		RouteName: route.Name,
@@ -1006,6 +1013,8 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 	
 	// Follow the exact same logic as ExecuteWithFailover
 	for layerIdx, layer := range pipeline.Layers {
+		h.engine.AdvanceRoundRobin(routeID, layer.Level)
+
 		layerResult := SimulateLayerResult{
 			Layer:   layer.Level,
 			Targets: make([]SimulateTargetResult, 0),
@@ -1061,7 +1070,7 @@ func (h *Handlers) SimulateRoute(c *gin.Context) {
 				
 				// Note: RecordFailure is already called by CheckTarget, so we don't call it again here
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
-					Failed(errMsg)
+					Failed(errMsg, targetResult.LatencyMs)
 				
 				// Start cooldown immediately on failure (CheckTarget doesn't do this)
 				h.stateMgr.StartCooldownTimed(ctx, target.ID)
