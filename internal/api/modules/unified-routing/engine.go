@@ -46,10 +46,11 @@ type RoutingEngine interface {
 
 // RoutingDecision represents the decision made by the routing engine.
 type RoutingDecision struct {
-	RouteID   string
-	RouteName string
-	TraceID   string
-	Pipeline  *Pipeline
+	RouteID    string
+	RouteName  string
+	InputModel string
+	TraceID    string
+	Pipeline   *Pipeline
 }
 
 // DefaultRoutingEngine implements RoutingEngine.
@@ -122,10 +123,11 @@ func (e *DefaultRoutingEngine) Route(ctx context.Context, modelName string) (*Ro
 	}
 
 	return &RoutingDecision{
-		RouteID:   route.ID,
-		RouteName: route.Name,
-		TraceID:   "trace-" + generateShortID(),
-		Pipeline:  pipeline,
+		RouteID:    route.ID,
+		RouteName:  route.Name,
+		InputModel: modelName,
+		TraceID:    "trace-" + generateShortID(),
+		Pipeline:   pipeline,
 	}, nil
 }
 
@@ -472,7 +474,7 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 		go e.healthChecker.TriggerCheckUntimedCoolingTargets(ctx, decision.RouteID)
 	}
 
-	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName)
+	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName, decision.InputModel)
 	startTime := time.Now()
 
 	// Try each layer in order
@@ -592,7 +594,7 @@ func (e *DefaultRoutingEngine) ExecuteStreamWithFailover(
 		go e.healthChecker.TriggerCheckUntimedCoolingTargets(ctx, decision.RouteID)
 	}
 
-	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName)
+	traceBuilder := NewTraceBuilder(decision.RouteID, decision.RouteName, decision.InputModel)
 	startTime := time.Now()
 
 	// Try each layer in order

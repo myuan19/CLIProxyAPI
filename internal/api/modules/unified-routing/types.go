@@ -171,6 +171,7 @@ type RequestTrace struct {
 	TraceID        string         `json:"trace_id"`
 	RouteID        string         `json:"route_id"`
 	RouteName      string         `json:"route_name"`
+	InputModel     string         `json:"input_model,omitempty"`
 	Timestamp      time.Time      `json:"timestamp"`
 	Status         TraceStatus    `json:"status"`
 	TotalLatencyMs int64          `json:"total_latency_ms"`

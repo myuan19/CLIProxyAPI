@@ -262,14 +262,15 @@ type TraceBuilder struct {
 }
 
 // NewTraceBuilder creates a new trace builder.
-func NewTraceBuilder(routeID, routeName string) *TraceBuilder {
+func NewTraceBuilder(routeID, routeName, inputModel string) *TraceBuilder {
 	return &TraceBuilder{
 		trace: &RequestTrace{
-			TraceID:   "trace-" + uuid.New().String()[:8],
-			RouteID:   routeID,
-			RouteName: routeName,
-			Timestamp: time.Now(),
-			Attempts:  make([]AttemptTrace, 0),
+			TraceID:    "trace-" + uuid.New().String()[:8],
+			RouteID:    routeID,
+			RouteName:  routeName,
+			InputModel: inputModel,
+			Timestamp:  time.Now(),
+			Attempts:   make([]AttemptTrace, 0),
 		},
 	}
 }

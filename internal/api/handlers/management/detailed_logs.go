@@ -89,10 +89,18 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 		return
 	}
 	if h.detailedLogger == nil {
+		apiKeys := make([]string, 0)
+		if h.cfg != nil {
+			for _, key := range h.cfg.APIKeys {
+				if key != "" {
+					apiKeys = append(apiKeys, logging.MaskAPIKey(key))
+				}
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"records":  []any{},
 			"total":    0,
-			"api_keys": []string{},
+			"api_keys": apiKeys,
 		})
 		return
 	}
