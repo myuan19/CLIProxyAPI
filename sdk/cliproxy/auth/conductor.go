@@ -1614,6 +1614,30 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// DeleteByID removes an auth entry from manager memory and backing store.
+func (m *Manager) DeleteByID(ctx context.Context, id string) error {
+	if m == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+
+	m.mu.Lock()
+	delete(m.auths, id)
+	m.mu.Unlock()
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+
+	if m.store == nil || shouldSkipPersist(ctx) {
+		return nil
+	}
+	if err := m.store.Delete(ctx, id); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Executor returns the registered provider executor for a provider key.
 func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 	if m == nil {

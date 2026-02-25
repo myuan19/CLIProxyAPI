@@ -1014,8 +1014,8 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 			return
 		}
 
-		// Check if this model is a route alias
-		_, _, routeErr := engine.GetRoutingTarget(c.Request.Context(), modelName)
+		// Check if this model is a route alias (only check route existence, not target availability)
+		_, routeErr := engine.Route(c.Request.Context(), modelName)
 
 		if routeErr == nil {
 			// Model is a route alias - execute with full failover support
@@ -1088,8 +1088,8 @@ func (s *Server) wrapWithUnifiedRoutingGemini(originalHandler gin.HandlerFunc) g
 			return
 		}
 
-		// Check if this model is a route alias
-		_, _, routeErr := engine.GetRoutingTarget(c.Request.Context(), modelName)
+		// Check if this model is a route alias (only check route existence, not target availability)
+		_, routeErr := engine.Route(c.Request.Context(), modelName)
 
 		if routeErr == nil {
 			// Model is a route alias - execute with unified routing

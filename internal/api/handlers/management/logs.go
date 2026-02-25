@@ -22,7 +22,16 @@ const (
 	logScannerMaxBuffer     = 8 * 1024 * 1024
 )
 
-// GetLogs returns log lines with optional incremental loading.
+// GetLogs returns log lines with line-number-based pagination.
+//
+// Query parameters (mutually exclusive modes):
+//   - n=<N>:              return the latest N lines
+//   - start=<S>&end=<E>:  return lines S..E (1-based, inclusive)
+//   - start=<S>:          return lines S..end-of-log
+//   - (no params):        return all lines
+//
+// "n" cannot be combined with "start"/"end".
+// "end" without "start" is invalid.
 func (h *Handler) GetLogs(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
@@ -46,11 +55,11 @@ func (h *Handler) GetLogs(c *gin.Context) {
 	files, err := h.collectLogFiles(logDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			cutoff := parseCutoff(c.Query("after"))
 			c.JSON(http.StatusOK, gin.H{
-				"lines":            []string{},
-				"line-count":       0,
-				"latest-timestamp": cutoff,
+				"lines":       []string{},
+				"start_line":  0,
+				"end_line":    0,
+				"total_lines": 0,
 			})
 			return
 		}
@@ -58,29 +67,94 @@ func (h *Handler) GetLogs(c *gin.Context) {
 		return
 	}
 
-	limit, errLimit := parseLimit(c.Query("limit"))
-	if errLimit != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %v", errLimit)})
+	nStr := strings.TrimSpace(c.Query("n"))
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	hasN := nStr != ""
+	hasStart := startStr != ""
+	hasEnd := endStr != ""
+
+	if hasN && (hasStart || hasEnd) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'n' cannot be combined with 'start' or 'end'"})
+		return
+	}
+	if hasEnd && !hasStart {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'end' requires 'start'"})
 		return
 	}
 
-	cutoff := parseCutoff(c.Query("after"))
-	acc := newLogAccumulator(cutoff, limit)
-	for i := range files {
-		if errProcess := acc.consumeFile(files[i]); errProcess != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file %s: %v", files[i], errProcess)})
-			return
-		}
+	index, totalLines, errIndex := buildFileLineIndex(files)
+	if errIndex != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to index log files: %v", errIndex)})
+		return
 	}
 
-	lines, total, latest := acc.result()
-	if latest == 0 || latest < cutoff {
-		latest = cutoff
+	var reqStart, reqEnd int
+
+	switch {
+	case hasN:
+		n, errN := strconv.Atoi(nStr)
+		if errN != nil || n <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'n' must be a positive integer"})
+			return
+		}
+		reqEnd = totalLines
+		reqStart = totalLines - n + 1
+		if reqStart < 1 {
+			reqStart = 1
+		}
+
+	case hasStart:
+		s, errS := strconv.Atoi(startStr)
+		if errS != nil || s < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'start' must be a positive integer"})
+			return
+		}
+		reqStart = s
+		if hasEnd {
+			e, errE := strconv.Atoi(endStr)
+			if errE != nil || e < 1 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'end' must be a positive integer"})
+				return
+			}
+			if e < s {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "parameter 'end' must be >= 'start'"})
+				return
+			}
+			reqEnd = e
+		} else {
+			reqEnd = totalLines
+		}
+
+	default:
+		reqStart = 1
+		reqEnd = totalLines
 	}
+
+	if totalLines == 0 || reqStart > totalLines {
+		c.JSON(http.StatusOK, gin.H{
+			"lines":       []string{},
+			"start_line":  reqStart,
+			"end_line":    totalLines,
+			"total_lines": totalLines,
+		})
+		return
+	}
+	if reqEnd > totalLines {
+		reqEnd = totalLines
+	}
+
+	lines, errRead := extractLineRange(index, reqStart, reqEnd)
+	if errRead != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log lines: %v", errRead)})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"lines":            lines,
-		"line-count":       total,
-		"latest-timestamp": latest,
+		"lines":       lines,
+		"start_line":  reqStart,
+		"end_line":    reqEnd,
+		"total_lines": totalLines,
 	})
 }
 
@@ -397,124 +471,107 @@ func (h *Handler) collectLogFiles(dir string) ([]string, error) {
 	return paths, nil
 }
 
-type logAccumulator struct {
-	cutoff  int64
-	limit   int
-	lines   []string
-	total   int
-	latest  int64
-	include bool
+type fileLineInfo struct {
+	path      string
+	lineCount int
+	startLine int
 }
 
-func newLogAccumulator(cutoff int64, limit int) *logAccumulator {
-	capacity := 256
-	if limit > 0 && limit < capacity {
-		capacity = limit
+func buildFileLineIndex(files []string) ([]fileLineInfo, int, error) {
+	var index []fileLineInfo
+	totalLines := 0
+	for _, path := range files {
+		count, err := countFileLines(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		if count == 0 {
+			continue
+		}
+		index = append(index, fileLineInfo{
+			path:      path,
+			lineCount: count,
+			startLine: totalLines + 1,
+		})
+		totalLines += count
 	}
-	return &logAccumulator{
-		cutoff: cutoff,
-		limit:  limit,
-		lines:  make([]string, 0, capacity),
-	}
+	return index, totalLines, nil
 }
 
-func (acc *logAccumulator) consumeFile(path string) error {
-	file, err := os.Open(path)
+func countFileLines(path string) (int, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer func() { _ = f.Close() }()
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(f)
 	buf := make([]byte, 0, logScannerInitialBuffer)
 	scanner.Buffer(buf, logScannerMaxBuffer)
+	count := 0
 	for scanner.Scan() {
-		acc.addLine(scanner.Text())
+		count++
 	}
-	if errScan := scanner.Err(); errScan != nil {
-		return errScan
-	}
-	return nil
+	return count, scanner.Err()
 }
 
-func (acc *logAccumulator) addLine(raw string) {
-	line := strings.TrimRight(raw, "\r")
-	acc.total++
-	ts := parseTimestamp(line)
-	if ts > acc.latest {
-		acc.latest = ts
-	}
-	if ts > 0 {
-		acc.include = acc.cutoff == 0 || ts > acc.cutoff
-		if acc.cutoff == 0 || acc.include {
-			acc.append(line)
+func extractLineRange(index []fileLineInfo, start, end int) ([]string, error) {
+	var lines []string
+	for _, fi := range index {
+		fileEnd := fi.startLine + fi.lineCount - 1
+		if fileEnd < start || fi.startLine > end {
+			continue
 		}
-		return
+		localStart := 1
+		if start > fi.startLine {
+			localStart = start - fi.startLine + 1
+		}
+		localEnd := fi.lineCount
+		if end < fileEnd {
+			localEnd = end - fi.startLine + 1
+		}
+		chunk, err := readFileLineRange(fi.path, localStart, localEnd)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, chunk...)
 	}
-	if acc.cutoff == 0 || acc.include {
-		acc.append(line)
+	if lines == nil {
+		lines = []string{}
 	}
+	return lines, nil
 }
 
-func (acc *logAccumulator) append(line string) {
-	acc.lines = append(acc.lines, line)
-	if acc.limit > 0 && len(acc.lines) > acc.limit {
-		acc.lines = acc.lines[len(acc.lines)-acc.limit:]
-	}
-}
-
-func (acc *logAccumulator) result() ([]string, int, int64) {
-	if acc.lines == nil {
-		acc.lines = []string{}
-	}
-	return acc.lines, acc.total, acc.latest
-}
-
-func parseCutoff(raw string) int64 {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return 0
-	}
-	ts, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || ts <= 0 {
-		return 0
-	}
-	return ts
-}
-
-func parseLimit(raw string) (int, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return 0, nil
-	}
-	limit, err := strconv.Atoi(value)
+func readFileLineRange(path string, start, end int) ([]string, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return 0, fmt.Errorf("must be a positive integer")
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	if limit <= 0 {
-		return 0, fmt.Errorf("must be greater than zero")
-	}
-	return limit, nil
-}
+	defer func() { _ = f.Close() }()
 
-func parseTimestamp(line string) int64 {
-	if strings.HasPrefix(line, "[") {
-		line = line[1:]
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 0, logScannerInitialBuffer)
+	scanner.Buffer(buf, logScannerMaxBuffer)
+
+	var lines []string
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum < start {
+			continue
+		}
+		if lineNum > end {
+			break
+		}
+		lines = append(lines, strings.TrimRight(scanner.Text(), "\r"))
 	}
-	if len(line) < 19 {
-		return 0
-	}
-	candidate := line[:19]
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", candidate, time.Local)
-	if err != nil {
-		return 0
-	}
-	return t.Unix()
+	return lines, scanner.Err()
 }
 
 func isRotatedLogFile(name string) bool {

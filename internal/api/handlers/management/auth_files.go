@@ -906,6 +906,11 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	if authID == "" {
 		return
 	}
+	// Prefer hard-delete from in-memory manager to avoid tombstone accumulation.
+	// Fallback to soft-disable for backward safety if delete path fails.
+	if err := h.authManager.DeleteByID(ctx, authID); err == nil {
+		return
+	}
 	if auth, ok := h.authManager.GetByID(authID); ok {
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled

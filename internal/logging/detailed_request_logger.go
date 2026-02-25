@@ -32,7 +32,7 @@ const (
 	legacyDetailedLogFileName = "detailed-requests.jsonl"
 
 	// defaultDetailedMaxSizeMB is the default maximum total size of detail files in MB.
-	defaultDetailedMaxSizeMB = 20
+	defaultDetailedMaxSizeMB = 100
 
 	// defaultDetailedMaxFiles is the default maximum number of detail files to keep.
 	defaultDetailedMaxFiles = 500
@@ -207,6 +207,21 @@ func mergeBodies(meta *DetailedRequestRecord, bodies *DetailedRecordBodies) {
 	}
 }
 
+// IndexEntry is a lightweight record stored in the index file for fast filtering
+// without reading individual meta files.
+type IndexEntry struct {
+	ID           string `json:"id"`
+	Filename     string `json:"file"`
+	APIKey       string `json:"api_key"`
+	APIKeyHash   string `json:"api_key_hash"`
+	StatusCode   int    `json:"status"`
+	IsSimulated  bool   `json:"sim,omitempty"`
+	Timestamp    int64  `json:"ts"`
+	Model        string `json:"model,omitempty"`
+}
+
+const indexFileName = "index.json"
+
 // DetailedRequestLogger handles structured logging of detailed request records
 // as individual JSON files in the logs directory.
 type DetailedRequestLogger struct {
@@ -335,6 +350,8 @@ func (dl *DetailedRequestLogger) writeRecordFile(record *DetailedRequestRecord) 
 		return fmt.Errorf("failed to write bodies file: %w", err)
 	}
 
+	dl.appendToIndex(record, baseFilename)
+
 	dl.mu.Lock()
 	dl.writeCount++
 	shouldCleanup := dl.writeCount%cleanupInterval == 0
@@ -452,6 +469,8 @@ func (dl *DetailedRequestLogger) cleanupOldFiles() {
 		}
 		metaFiles = metaFiles[1:]
 	}
+
+	dl.RebuildIndex()
 }
 
 // isMetaFile checks if a filename is a meta file (not a bodies companion file).
@@ -557,39 +576,128 @@ func (dl *DetailedRequestLogger) ReadRecords(filter RecordFilter) ([]DetailedReq
 	return filtered, total, apiKeys, nil
 }
 
-// ReadRecordSummaries reads only lightweight meta files (no bodies) for fast listing.
-func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter) ([]DetailedRequestSummary, int, []string, error) {
+// loadIndex reads the index file and returns all entries (newest first).
+func (dl *DetailedRequestLogger) loadIndex() ([]IndexEntry, error) {
+	data, err := os.ReadFile(filepath.Join(dl.logsDir, indexFileName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var entries []IndexEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// saveIndex writes the full index to disk.
+func (dl *DetailedRequestLogger) saveIndex(entries []IndexEntry) error {
+	if err := os.MkdirAll(dl.logsDir, 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dl.logsDir, indexFileName), data, 0644)
+}
+
+// appendToIndex adds a new record entry to the front of the index (newest first).
+func (dl *DetailedRequestLogger) appendToIndex(record *DetailedRequestRecord, filename string) {
+	entries, _ := dl.loadIndex()
+	entry := IndexEntry{
+		ID:          record.ID,
+		Filename:    filename,
+		APIKey:      record.APIKey,
+		APIKeyHash:  record.APIKeyHash,
+		StatusCode:  record.StatusCode,
+		IsSimulated: record.IsSimulated,
+		Timestamp:   record.Timestamp.Unix(),
+		Model:       record.Model,
+	}
+	entries = append([]IndexEntry{entry}, entries...)
+	if err := dl.saveIndex(entries); err != nil {
+		log.WithError(err).Warn("failed to update detailed request index")
+	}
+}
+
+// RebuildIndex rebuilds the index from meta files on disk.
+func (dl *DetailedRequestLogger) RebuildIndex() error {
 	detailFiles, err := dl.listDetailFiles()
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to list detail files: %w", err)
+		return err
 	}
-
-	var allRecords []DetailedRequestRecord
-	apiKeySet := make(map[string]struct{})
-
-	// Only read meta files — no bodies, much faster
-	for _, entry := range detailFiles {
-		record, errRead := dl.readRecordFromFile(entry.Name())
+	entries := make([]IndexEntry, 0, len(detailFiles))
+	for _, f := range detailFiles {
+		record, errRead := dl.readRecordFromFile(f.Name())
 		if errRead != nil {
 			continue
 		}
-		allRecords = append(allRecords, *record)
-		if record.APIKey != "" {
-			apiKeySet[record.APIKey] = struct{}{}
+		entries = append(entries, IndexEntry{
+			ID:          record.ID,
+			Filename:    f.Name(),
+			APIKey:      record.APIKey,
+			APIKeyHash:  record.APIKeyHash,
+			StatusCode:  record.StatusCode,
+			IsSimulated: record.IsSimulated,
+			Timestamp:   record.Timestamp.Unix(),
+			Model:       record.Model,
+		})
+	}
+	return dl.saveIndex(entries)
+}
+
+// applyIndexFilters filters index entries based on the given criteria.
+func applyIndexFilters(entries []IndexEntry, filter RecordFilter) []IndexEntry {
+	filtered := make([]IndexEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.IsSimulated && !filter.IncludeSimulated {
+			continue
+		}
+		if filter.APIKeyHash != "" && e.APIKeyHash != filter.APIKeyHash && e.APIKey != filter.APIKeyHash {
+			continue
+		}
+		if !matchStatusCode(e.StatusCode, filter.StatusCode) {
+			continue
+		}
+		ts := time.Unix(e.Timestamp, 0)
+		if !filter.After.IsZero() && ts.Before(filter.After) {
+			continue
+		}
+		if !filter.Before.IsZero() && ts.After(filter.Before) {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered
+}
+
+// ReadRecordSummaries returns paginated summaries using the index file.
+// Records with IDs in knownIDs are returned as cached stubs ({id, cached: true})
+// instead of reading the meta file from disk.
+func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter, knownIDs map[string]bool) ([]any, int, error) {
+	index, err := dl.loadIndex()
+	if err != nil || index == nil {
+		if rebuildErr := dl.RebuildIndex(); rebuildErr != nil {
+			return nil, 0, fmt.Errorf("index rebuild failed: %w", rebuildErr)
+		}
+		index, _ = dl.loadIndex()
+		if index == nil {
+			return []any{}, 0, nil
 		}
 	}
 
-	apiKeys := make([]string, 0, len(apiKeySet))
-	for k := range apiKeySet {
-		apiKeys = append(apiKeys, k)
-	}
-
-	filtered := dl.applyFilters(allRecords, filter)
+	filtered := applyIndexFilters(index, filter)
 	total := len(filtered)
 
 	if filter.Offset > 0 {
 		if filter.Offset >= len(filtered) {
-			filtered = []DetailedRequestRecord{}
+			filtered = nil
 		} else {
 			filtered = filtered[filter.Offset:]
 		}
@@ -598,11 +706,19 @@ func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter) ([]Det
 		filtered = filtered[:filter.Limit]
 	}
 
-	summaries := make([]DetailedRequestSummary, len(filtered))
-	for i := range filtered {
-		summaries[i] = filtered[i].ToSummary()
+	results := make([]any, 0, len(filtered))
+	for _, entry := range filtered {
+		if len(knownIDs) > 0 && knownIDs[entry.ID] {
+			results = append(results, map[string]any{"id": entry.ID, "cached": true})
+		} else {
+			record, errRead := dl.readRecordFromFile(entry.Filename)
+			if errRead != nil {
+				continue
+			}
+			results = append(results, record.ToSummary())
+		}
 	}
-	return summaries, total, apiKeys, nil
+	return results, total, nil
 }
 
 // readBodiesFromFile reads and parses a bodies companion file.
@@ -657,6 +773,8 @@ func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestReco
 
 // DeleteAll removes all detail log files (meta + bodies) and the legacy JSONL file.
 func (dl *DetailedRequestLogger) DeleteAll() error {
+	os.Remove(filepath.Join(dl.logsDir, indexFileName))
+
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -147,7 +147,17 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 		}
 	}
 
-	summaries, total, _, err := h.detailedLogger.ReadRecordSummaries(filter)
+	// Parse known_ids for incremental sync
+	knownIDs := make(map[string]bool)
+	if ids := c.Query("known_ids"); ids != "" {
+		for _, id := range strings.Split(ids, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				knownIDs[id] = true
+			}
+		}
+	}
+
+	results, total, err := h.detailedLogger.ReadRecordSummaries(filter, knownIDs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read records: %v", err)})
 		return
@@ -164,7 +174,7 @@ func (h *Handler) ListDetailedRequests(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"records":  summaries,
+		"records":  results,
 		"total":    total,
 		"offset":   filter.Offset,
 		"limit":    filter.Limit,

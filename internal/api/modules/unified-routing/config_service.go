@@ -379,14 +379,6 @@ func (s *DefaultConfigService) validatePipeline(pipeline *Pipeline) []Validation
 		}
 		seenLevels[layer.Level] = true
 
-		// Check targets
-		if len(layer.Targets) == 0 {
-			errors = append(errors, ValidationError{
-				Field:   fmt.Sprintf("layers[%d].targets", i),
-				Message: "at least one target is required per layer",
-			})
-		}
-
 		for j, target := range layer.Targets {
 			if target.CredentialID == "" {
 				errors = append(errors, ValidationError{

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -822,8 +823,9 @@ func (h *Handlers) ListCredentials(c *gin.Context) {
 	credentials := make([]CredentialInfo, 0)
 
 	for _, auth := range auths {
-		// Skip disabled/removed auth entries
-		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+
+		// Skip credentials that have been removed (deleted via management API)
+		if strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api") {
 			continue
 		}
 
@@ -854,13 +856,18 @@ func (h *Handlers) ListCredentials(c *gin.Context) {
 			})
 		}
 
+		credStatus := string(auth.Status)
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			credStatus = "disabled"
+		}
+
 		cred := CredentialInfo{
 			ID:       auth.ID,
 			Provider: auth.Provider,
 			Type:     credType,
 			Label:    auth.Label,
 			Prefix:   auth.Prefix,
-			Status:   string(auth.Status),
+			Status:   credStatus,
 			Models:   modelInfos,
 		}
 
