@@ -749,6 +749,79 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	return models
 }
 
+// GetAvailableModelsExcludingDisabled returns available models, excluding those that are
+// provided only by disabled clients. When disabledClientIDs is nil or empty, behavior
+// matches GetAvailableModels. Used by /v1/models to hide models from disabled providers.
+func (r *ModelRegistry) GetAvailableModelsExcludingDisabled(handlerType string, disabledClientIDs map[string]struct{}) []map[string]any {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	models := make([]map[string]any, 0)
+	quotaExpiredDuration := 5 * time.Minute
+
+	for modelID, registration := range r.models {
+		availableClients := registration.Count
+		now := time.Now()
+
+		expiredClients := 0
+		for _, quotaTime := range registration.QuotaExceededClients {
+			if quotaTime != nil && now.Sub(*quotaTime) < quotaExpiredDuration {
+				expiredClients++
+			}
+		}
+
+		cooldownSuspended := 0
+		otherSuspended := 0
+		if registration.SuspendedClients != nil {
+			for _, reason := range registration.SuspendedClients {
+				if strings.EqualFold(reason, "quota") {
+					cooldownSuspended++
+					continue
+				}
+				otherSuspended++
+			}
+		}
+
+		effectiveClients := availableClients - expiredClients - otherSuspended
+		if effectiveClients < 0 {
+			effectiveClients = 0
+		}
+
+		if effectiveClients <= 0 && !(availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+			continue
+		}
+
+		if len(disabledClientIDs) > 0 {
+			var contributing []string
+			for clientID, modelIDs := range r.clientModels {
+				for _, id := range modelIDs {
+					if strings.EqualFold(strings.TrimSpace(id), modelID) {
+						contributing = append(contributing, clientID)
+						break
+					}
+				}
+			}
+			allDisabled := len(contributing) > 0
+			for _, cid := range contributing {
+				if _, disabled := disabledClientIDs[cid]; !disabled {
+					allDisabled = false
+					break
+				}
+			}
+			if allDisabled {
+				continue
+			}
+		}
+
+		model := r.convertModelToMap(registration.Info, handlerType)
+		if model != nil {
+			models = append(models, model)
+		}
+	}
+
+	return models
+}
+
 // GetAvailableModelsByProvider returns models available for the given provider identifier.
 // Parameters:
 //   - provider: Provider identifier (e.g., "codex", "gemini", "antigravity")

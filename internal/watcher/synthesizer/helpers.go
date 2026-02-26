@@ -101,6 +101,14 @@ func ApplyAuthExcludedModelsMeta(auth *coreauth.Auth, cfg *config.Config, perKey
 	if authKind != "" {
 		auth.Attributes["auth_kind"] = authKind
 	}
+	// When excluded models contains '*', mark the auth as disabled (all models excluded)
+	for _, m := range combined {
+		if strings.TrimSpace(strings.ToLower(m)) == "*" {
+			auth.Disabled = true
+			auth.Status = coreauth.StatusDisabled
+			break
+		}
+	}
 }
 
 // addConfigHeadersToAttrs adds header configuration to auth attributes.

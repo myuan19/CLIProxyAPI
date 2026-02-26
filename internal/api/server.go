@@ -29,6 +29,7 @@ import (
 	unifiedrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/unified-routing"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -851,8 +852,42 @@ func (s *Server) unifiedGeminiModelsHandler(geminiHandler *gemini.GeminiAPIHandl
 			}
 		}
 
-		// Delegate to original handler
-		geminiHandler.GeminiModels(c)
+		// Return models with disabled providers filtered out
+		disabledIDs := make(map[string]struct{})
+		if s.handlers != nil && s.handlers.AuthManager != nil {
+			for _, a := range s.handlers.AuthManager.List() {
+				if a != nil && (a.Disabled || a.Status == auth.StatusDisabled) && a.ID != "" {
+					disabledIDs[a.ID] = struct{}{}
+				}
+			}
+		}
+		rawModels := registry.GetGlobalRegistry().GetAvailableModelsExcludingDisabled("gemini", disabledIDs)
+		defaultMethods := []string{"generateContent"}
+		normalizedModels := make([]map[string]any, 0, len(rawModels))
+		for _, model := range rawModels {
+			normalizedModel := make(map[string]any, len(model))
+			for k, v := range model {
+				normalizedModel[k] = v
+			}
+			if name, ok := normalizedModel["name"].(string); ok && name != "" {
+				if !strings.HasPrefix(name, "models/") {
+					normalizedModel["name"] = "models/" + name
+				}
+				if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
+					normalizedModel["displayName"] = name
+				}
+				if description, _ := normalizedModel["description"].(string); description == "" {
+					normalizedModel["description"] = name
+				}
+			}
+			if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
+				normalizedModel["supportedGenerationMethods"] = defaultMethods
+			}
+			normalizedModels = append(normalizedModels, normalizedModel)
+		}
+		c.JSON(200, gin.H{
+			"models": normalizedModels,
+		})
 	}
 }
 
@@ -891,6 +926,15 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 					routeNames := engine.GetRouteNames(c.Request.Context())
 					routeModels := buildRouteAliasModels(routeNames)
 
+					disabledIDs := make(map[string]struct{})
+					if s.handlers != nil && s.handlers.AuthManager != nil {
+						for _, a := range s.handlers.AuthManager.List() {
+							if a != nil && (a.Disabled || a.Status == auth.StatusDisabled) && a.ID != "" {
+								disabledIDs[a.ID] = struct{}{}
+							}
+						}
+					}
+
 					if shouldHide {
 						// Return only route aliases
 						log.Debugf("[UnifiedRouting] Returning %d route aliases as models: %v", len(routeNames), routeNames)
@@ -907,7 +951,7 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 
 					if isClaude {
 						// Claude format: data[], has_more, first_id, last_id
-						origModels := claudeHandler.Models()
+						origModels := registry.GetGlobalRegistry().GetAvailableModelsExcludingDisabled("claude", disabledIDs)
 						merged := append(origModels, routeModels...)
 						firstID := ""
 						lastID := ""
@@ -930,7 +974,7 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 					}
 
 					// OpenAI format: object=list, data[]
-					allModels := openaiHandler.Models()
+					allModels := registry.GetGlobalRegistry().GetAvailableModelsExcludingDisabled("openai", disabledIDs)
 					// Filter to standard fields like OpenAIModels does
 					filteredModels := make([]map[string]any, 0, len(allModels)+len(routeModels))
 					for _, model := range allModels {
@@ -961,12 +1005,42 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			log.Debugf("[UnifiedRouting] /v1/models: module is nil")
 		}
 
-		// Unified routing not active – delegate to original handlers
+		// Unified routing not active – return models with disabled providers filtered out
+		disabledIDs := make(map[string]struct{})
+		if s.handlers != nil && s.handlers.AuthManager != nil {
+			for _, a := range s.handlers.AuthManager.List() {
+				if a != nil && (a.Disabled || a.Status == auth.StatusDisabled) && a.ID != "" {
+					disabledIDs[a.ID] = struct{}{}
+				}
+			}
+		}
 		userAgent := c.GetHeader("User-Agent")
 		if strings.HasPrefix(userAgent, "claude-cli") {
-			claudeHandler.ClaudeModels(c)
+			models := registry.GetGlobalRegistry().GetAvailableModelsExcludingDisabled("claude", disabledIDs)
+			firstID, lastID := "", ""
+			if len(models) > 0 {
+				if id, ok := models[0]["id"].(string); ok {
+					firstID = id
+				}
+				if id, ok := models[len(models)-1]["id"].(string); ok {
+					lastID = id
+				}
+			}
+			c.JSON(200, gin.H{"data": models, "has_more": false, "first_id": firstID, "last_id": lastID})
 		} else {
-			openaiHandler.OpenAIModels(c)
+			allModels := registry.GetGlobalRegistry().GetAvailableModelsExcludingDisabled("openai", disabledIDs)
+			filteredModels := make([]map[string]any, 0, len(allModels))
+			for _, model := range allModels {
+				f := map[string]any{"id": model["id"], "object": model["object"]}
+				if created, exists := model["created"]; exists {
+					f["created"] = created
+				}
+				if ownedBy, exists := model["owned_by"]; exists {
+					f["owned_by"] = ownedBy
+				}
+				filteredModels = append(filteredModels, f)
+			}
+			c.JSON(200, gin.H{"object": "list", "data": filteredModels})
 		}
 	}
 }

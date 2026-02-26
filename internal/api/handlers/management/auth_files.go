@@ -774,9 +774,11 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	log.Infof("[PatchAuthFileStatus] request name=%q disabled=%v", name, *req.Disabled)
+
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
+	// Find auth by ID, FileName, Label, Prefix, or API key (for config-synthesized auths)
 	var targetAuth *coreauth.Auth
 	if auth, ok := h.authManager.GetByID(name); ok {
 		targetAuth = auth
@@ -788,12 +790,38 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 				break
 			}
 		}
+		if targetAuth == nil {
+			for _, auth := range auths {
+				if (auth.Label != "" && auth.Label == name) || (auth.Prefix != "" && auth.Prefix == name) {
+					targetAuth = auth
+					break
+				}
+			}
+		}
+		// Fallback: match by api_key attribute (Gemini/Claude/Codex/Vertex API keys from config)
+		if targetAuth == nil {
+			for _, auth := range auths {
+				if auth.FileName != "" {
+					continue // skip file-based auths
+				}
+				if auth.Attributes != nil {
+					if apiKey := auth.Attributes["api_key"]; apiKey != "" && apiKey == name {
+						targetAuth = auth
+						break
+					}
+				}
+			}
+		}
 	}
 
 	if targetAuth == nil {
+		log.Warnf("[PatchAuthFileStatus] auth not found for name=%q (checked ID, FileName, Label, Prefix, api_key)", name)
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+
+	log.Infof("[PatchAuthFileStatus] found auth id=%q fileName=%q label=%q prefix=%q, updating disabled=%v",
+		targetAuth.ID, targetAuth.FileName, targetAuth.Label, targetAuth.Prefix, *req.Disabled)
 
 	// Update disabled state
 	targetAuth.Disabled = *req.Disabled
@@ -807,10 +835,12 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	targetAuth.UpdatedAt = time.Now()
 
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		log.Errorf("[PatchAuthFileStatus] Update failed for %q: %v", targetAuth.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
 
+	log.Infof("[PatchAuthFileStatus] success id=%q disabled=%v", targetAuth.ID, *req.Disabled)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
