@@ -364,7 +364,6 @@ func (s *DefaultConfigService) validatePipeline(pipeline *Pipeline) []Validation
 	var errors []ValidationError
 
 	if len(pipeline.Layers) == 0 {
-		errors = append(errors, ValidationError{Field: "layers", Message: "at least one layer is required"})
 		return errors
 	}
 
