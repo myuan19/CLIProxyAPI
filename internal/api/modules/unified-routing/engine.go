@@ -377,7 +377,7 @@ const failoverFirstChunkTimeout = 15 * time.Second
 // failoverNonStreamTimeout is the maximum time for a single non-streaming request
 // attempt during failover. Non-streaming requests must receive the full response
 // body, so this is set higher than the streaming first-chunk timeout.
-const failoverNonStreamTimeout = 30 * time.Second
+const failoverNonStreamTimeout = 45 * time.Second
 
 // filterAvailableTargets returns enabled, healthy targets from a layer.
 func (e *DefaultRoutingEngine) filterAvailableTargets(ctx context.Context, layer *Layer) []Target {

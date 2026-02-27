@@ -48,6 +48,23 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 			}
 		}
 
+		requestID := logging.GetGinRequestID(c)
+
+		// Phase 1: write a pending placeholder so the UI can show the request immediately.
+		pendingRecord := &logging.DetailedRequestRecord{
+			ID:        requestID,
+			Timestamp: startTime,
+			URL:       c.Request.URL.Path,
+			Method:    c.Request.Method,
+			Pending:   true,
+		}
+		if len(requestBody) > 0 {
+			if model := gjson.GetBytes(requestBody, "model").String(); model != "" {
+				pendingRecord.Model = model
+			}
+		}
+		logger.LogPending(pendingRecord)
+
 		// Capture request headers
 		requestHeaders := make(map[string][]string)
 		for key, values := range c.Request.Header {
@@ -55,8 +72,6 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 			copy(headerValues, values)
 			requestHeaders[key] = headerValues
 		}
-
-		requestID := logging.GetGinRequestID(c)
 
 		// Create a response capture wrapper if not already wrapped
 		detailedCapture := &detailedResponseCapture{
@@ -104,10 +119,16 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 		contentType := detailedCapture.Header().Get("Content-Type")
 		record.IsStreaming = strings.Contains(contentType, "text/event-stream")
 
-		// Capture response
+		// Capture response status code.
+		// detailedCapture.statusCode is only set when WriteHeader() is called on our wrapper.
+		// Fall back to the underlying Gin ResponseWriter's Status() to handle cases where
+		// headers were written before our wrapper was installed (e.g. Gin's NoRoute handler).
+		// If both are 0, keep it as 0 — the frontend displays "???" for unknown status.
 		finalStatus := detailedCapture.statusCode
 		if finalStatus == 0 {
-			finalStatus = http.StatusOK
+			if sw, ok := detailedCapture.ResponseWriter.(interface{ Status() int }); ok {
+				finalStatus = sw.Status()
+			}
 		}
 		record.StatusCode = finalStatus
 
@@ -125,6 +146,13 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 
 		// 重试部分：从 Gin 上下文中记录各次上游请求/响应（由 executor 在 DetailedRequestLog 开启时写入）
 		record.Attempts = extractAttempts(c)
+
+		// Extract format detection info
+		if fmtRaw, exists := c.Get("FORMAT_DETECTION_INFO"); exists {
+			if fmtInfo, ok := fmtRaw.(logging.FormatInfo); ok {
+				record.Format = &fmtInfo
+			}
+		}
 
 		// Extract errors
 		apiResponseError, isExist := c.Get("API_RESPONSE_ERROR")

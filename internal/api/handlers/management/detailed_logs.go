@@ -264,11 +264,7 @@ func generateCurlCommand(record *logging.DetailedRequestRecord) string {
 	}
 
 	if record.RequestBody != "" {
-		body := record.RequestBody
-		if len(body) > 10000 {
-			body = body[:10000] + "...[truncated]"
-		}
-		builder.WriteString(fmt.Sprintf(" \\\n  -d '%s'", escapeShellSingle(body)))
+		builder.WriteString(fmt.Sprintf(" \\\n  -d '%s'", escapeShellSingle(record.RequestBody)))
 	}
 
 	return builder.String()

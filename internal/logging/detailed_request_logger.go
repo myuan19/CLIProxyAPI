@@ -28,6 +28,9 @@ const (
 	// detailedBodiesSuffix is the suffix for body-data companion files.
 	detailedBodiesSuffix = ".bodies.json"
 
+	// detailedPendingSuffix is the suffix for in-flight request placeholder files.
+	detailedPendingSuffix = ".pending.json"
+
 	// legacyDetailedLogFileName is the old JSONL file name (for backward compatibility).
 	legacyDetailedLogFileName = "detailed-requests.jsonl"
 
@@ -44,6 +47,14 @@ const (
 	cleanupInterval = 20
 )
 
+// FormatInfo holds the format detection/correction result for a request.
+type FormatInfo struct {
+	EndpointFormat string `json:"endpoint_format"`
+	DetectedFormat string `json:"detected_format,omitempty"`
+	WasCorrected   bool   `json:"was_corrected,omitempty"`
+	HasError       bool   `json:"has_error,omitempty"`
+}
+
 // DetailedRequestRecord represents a single proxied request with all retry attempts.
 type DetailedRequestRecord struct {
 	ID              string              `json:"id"`
@@ -54,6 +65,7 @@ type DetailedRequestRecord struct {
 	Method          string              `json:"method"`
 	StatusCode      int                 `json:"status_code"`
 	Model           string              `json:"model,omitempty"`
+	Format          *FormatInfo         `json:"format,omitempty"`
 	RequestHeaders  map[string][]string `json:"request_headers,omitempty"`
 	RequestBody     string              `json:"request_body,omitempty"`
 	ResponseHeaders map[string][]string `json:"response_headers,omitempty"`
@@ -62,25 +74,59 @@ type DetailedRequestRecord struct {
 	TotalDurationMs int64               `json:"total_duration_ms"`
 	IsStreaming     bool                `json:"is_streaming"`
 	IsSimulated     bool                `json:"is_simulated,omitempty"`
+	Pending         bool                `json:"pending,omitempty"`
+	// AttemptCount is only populated when reading back lightweight simulated records
+	// that store attempt_count directly instead of a full attempts array.
+	AttemptCount    int                 `json:"attempt_count,omitempty"`
 	Error           string              `json:"error,omitempty"`
 }
 
 // DetailedRequestSummary is a lightweight projection of DetailedRequestRecord
 // returned by the list endpoint so the frontend doesn't have to download full bodies.
 type DetailedRequestSummary struct {
-	ID              string    `json:"id"`
-	Timestamp       time.Time `json:"timestamp"`
-	APIKey          string    `json:"api_key"`
-	APIKeyHash      string    `json:"api_key_hash"`
-	URL             string    `json:"url"`
-	Method          string    `json:"method"`
-	StatusCode      int       `json:"status_code"`
-	Model           string    `json:"model,omitempty"`
-	TotalDurationMs int64     `json:"total_duration_ms"`
-	IsStreaming     bool      `json:"is_streaming"`
-	IsSimulated     bool      `json:"is_simulated,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	AttemptCount    int       `json:"attempt_count"`
+	ID              string      `json:"id"`
+	Timestamp       time.Time   `json:"timestamp"`
+	APIKey          string      `json:"api_key"`
+	APIKeyHash      string      `json:"api_key_hash"`
+	URL             string      `json:"url"`
+	Method          string      `json:"method"`
+	StatusCode      int         `json:"status_code"`
+	Model           string      `json:"model,omitempty"`
+	Format          *FormatInfo `json:"format,omitempty"`
+	TotalDurationMs int64       `json:"total_duration_ms"`
+	IsStreaming     bool        `json:"is_streaming"`
+	IsSimulated     bool        `json:"is_simulated,omitempty"`
+	Pending         bool        `json:"pending,omitempty"`
+	Error           string      `json:"error,omitempty"`
+	AttemptCount    int         `json:"attempt_count"`
+	// NodeCount is the number of unique upstream nodes (url+auth combinations) used.
+	// A node that is internally retried multiple times still counts as one node.
+	NodeCount       int         `json:"node_count,omitempty"`
+}
+
+// attemptCount returns the number of upstream attempts.
+// For regular records it is len(Attempts); for simulated records read back from disk
+// the Attempts slice is empty and the count comes from the AttemptCount field.
+func (r *DetailedRequestRecord) attemptCount() int {
+	if len(r.Attempts) > 0 {
+		return len(r.Attempts)
+	}
+	return r.AttemptCount
+}
+
+// nodeCount returns the number of unique upstream nodes used.
+// A node is identified by the combination of upstream_url + auth.
+// Multiple internal retries to the same node count as one node.
+func (r *DetailedRequestRecord) nodeCount() int {
+	if len(r.Attempts) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(r.Attempts))
+	for _, a := range r.Attempts {
+		key := a.UpstreamURL + "::" + a.Auth
+		seen[key] = struct{}{}
+	}
+	return len(seen)
 }
 
 // ToSummary converts a full record to a lightweight summary.
@@ -94,11 +140,14 @@ func (r *DetailedRequestRecord) ToSummary() DetailedRequestSummary {
 		Method:          r.Method,
 		StatusCode:      r.StatusCode,
 		Model:           r.Model,
+		Format:          r.Format,
 		TotalDurationMs: r.TotalDurationMs,
 		IsStreaming:     r.IsStreaming,
 		IsSimulated:     r.IsSimulated,
+		Pending:         r.Pending,
 		Error:           r.Error,
-		AttemptCount:    len(r.Attempts),
+		AttemptCount:    r.attemptCount(),
+		NodeCount:       r.nodeCount(),
 	}
 }
 
@@ -222,6 +271,18 @@ type IndexEntry struct {
 
 const indexFileName = "index.json"
 
+type writeOpType int
+
+const (
+	writeOpComplete writeOpType = iota
+	writeOpPending
+)
+
+type writeOp struct {
+	opType writeOpType
+	record *DetailedRequestRecord
+}
+
 // DetailedRequestLogger handles structured logging of detailed request records
 // as individual JSON files in the logs directory.
 type DetailedRequestLogger struct {
@@ -230,7 +291,7 @@ type DetailedRequestLogger struct {
 	logsDir      string
 	maxSizeMB    int
 	maxFiles     int
-	writeCh      chan *DetailedRequestRecord
+	writeCh      chan *writeOp
 	stopCh       chan struct{}
 	stopped      bool
 	writeCount   int64 // counts writes for periodic cleanup
@@ -246,7 +307,7 @@ func NewDetailedRequestLogger(enabled bool, logsDir string, maxSizeMB int) *Deta
 		logsDir:   logsDir,
 		maxSizeMB: maxSizeMB,
 		maxFiles:  defaultDetailedMaxFiles,
-		writeCh:   make(chan *DetailedRequestRecord, detailedWriteBufferSize),
+		writeCh:   make(chan *writeOp, detailedWriteBufferSize),
 		stopCh:    make(chan struct{}),
 	}
 	go dl.writeLoop()
@@ -290,9 +351,28 @@ func (dl *DetailedRequestLogger) LogRecord(record *DetailedRequestRecord) {
 	dl.mu.Unlock()
 
 	select {
-	case dl.writeCh <- record:
+	case dl.writeCh <- &writeOp{opType: writeOpComplete, record: record}:
 	default:
 		log.Warn("detailed request log write channel full, dropping record")
+	}
+}
+
+// LogPending writes a lightweight placeholder file for an in-flight request.
+func (dl *DetailedRequestLogger) LogPending(record *DetailedRequestRecord) {
+	if record == nil {
+		return
+	}
+	dl.mu.Lock()
+	if !dl.enabled || dl.stopped {
+		dl.mu.Unlock()
+		return
+	}
+	dl.mu.Unlock()
+
+	select {
+	case dl.writeCh <- &writeOp{opType: writeOpPending, record: record}:
+	default:
+		log.Warn("detailed request log write channel full, dropping pending record")
 	}
 }
 
@@ -312,17 +392,45 @@ func (dl *DetailedRequestLogger) Close() {
 // writeLoop is the background goroutine that writes records to disk.
 func (dl *DetailedRequestLogger) writeLoop() {
 	defer close(dl.stopCh)
-	for record := range dl.writeCh {
-		if err := dl.writeRecordFile(record); err != nil {
-			log.WithError(err).Warn("failed to write detailed request record")
+	for op := range dl.writeCh {
+		switch op.opType {
+		case writeOpPending:
+			if err := dl.writePendingFile(op.record); err != nil {
+				log.WithError(err).Warn("failed to write pending record")
+			}
+		case writeOpComplete:
+			if err := dl.writeRecordFile(op.record); err != nil {
+				log.WithError(err).Warn("failed to write detailed request record")
+			}
 		}
 	}
 }
 
-// writeRecordFile writes a single record as two files: meta (no bodies) and bodies.
+// writePendingFile writes a lightweight placeholder JSON file for an in-flight request.
+func (dl *DetailedRequestLogger) writePendingFile(record *DetailedRequestRecord) error {
+	if err := os.MkdirAll(dl.logsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create logs directory: %w", err)
+	}
+	baseFilename := dl.generateDetailFilename(record)
+	pendingName := strings.TrimSuffix(baseFilename, detailedFileSuffix) + detailedPendingSuffix
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal pending record: %w", err)
+	}
+	data = append(data, '\n')
+	return os.WriteFile(filepath.Join(dl.logsDir, pendingName), data, 0644)
+}
+
+// writeRecordFile writes a record to disk.
+// Simulated records are stored as a single lightweight file (no bodies companion).
+// Regular records are stored as two files: meta (no bodies) and bodies.
 func (dl *DetailedRequestLogger) writeRecordFile(record *DetailedRequestRecord) error {
 	if err := os.MkdirAll(dl.logsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create logs directory: %w", err)
+	}
+
+	if record.IsSimulated {
+		return dl.writeSimulatedRecordFile(record)
 	}
 
 	baseFilename := dl.generateDetailFilename(record)
@@ -350,6 +458,64 @@ func (dl *DetailedRequestLogger) writeRecordFile(record *DetailedRequestRecord) 
 		return fmt.Errorf("failed to write bodies file: %w", err)
 	}
 
+	// Remove the pending placeholder now that the complete record is written.
+	pendingName := strings.TrimSuffix(baseFilename, detailedFileSuffix) + detailedPendingSuffix
+	os.Remove(filepath.Join(dl.logsDir, pendingName))
+
+	dl.appendToIndex(record, baseFilename)
+
+	dl.mu.Lock()
+	dl.writeCount++
+	shouldCleanup := dl.writeCount%cleanupInterval == 0
+	dl.mu.Unlock()
+
+	if shouldCleanup {
+		dl.cleanupOldFiles()
+	}
+
+	return nil
+}
+
+// simulatedRecordSummary is the lightweight structure written to disk for simulated records.
+// It contains only what is shown in the frontend, with no request/response bodies.
+type simulatedRecordSummary struct {
+	ID              string      `json:"id"`
+	Timestamp       time.Time   `json:"timestamp"`
+	URL             string      `json:"url"`
+	Method          string      `json:"method"`
+	StatusCode      int         `json:"status_code"`
+	Model           string      `json:"model,omitempty"`
+	TotalDurationMs int64       `json:"total_duration_ms"`
+	IsSimulated     bool        `json:"is_simulated"`
+	AttemptCount    int         `json:"attempt_count"`
+}
+
+// writeSimulatedRecordFile writes a single lightweight JSON file for a simulated record.
+func (dl *DetailedRequestLogger) writeSimulatedRecordFile(record *DetailedRequestRecord) error {
+	baseFilename := dl.generateDetailFilename(record)
+	metaPath := filepath.Join(dl.logsDir, baseFilename)
+
+	summary := simulatedRecordSummary{
+		ID:              record.ID,
+		Timestamp:       record.Timestamp,
+		URL:             record.URL,
+		Method:          record.Method,
+		StatusCode:      record.StatusCode,
+		Model:           record.Model,
+		TotalDurationMs: record.TotalDurationMs,
+		IsSimulated:     true,
+		AttemptCount:    len(record.Attempts),
+	}
+
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal simulated record: %w", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(metaPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write simulated record file: %w", err)
+	}
+
 	dl.appendToIndex(record, baseFilename)
 
 	dl.mu.Lock()
@@ -366,6 +532,9 @@ func (dl *DetailedRequestLogger) writeRecordFile(record *DetailedRequestRecord) 
 
 // generateDetailFilename creates a filename for a detail log file.
 // Format: detail-v1-chat-completions-2026-02-08T130145-42cf8292.json
+//
+// For simulated records whose ID follows the pattern "sim-YYYYMMDDTHHMMSS-<hex>",
+// only the trailing hex part is used to keep filenames short.
 func (dl *DetailedRequestLogger) generateDetailFilename(record *DetailedRequestRecord) string {
 	path := record.URL
 	if strings.Contains(path, "?") {
@@ -380,6 +549,11 @@ func (dl *DetailedRequestLogger) generateDetailFilename(record *DetailedRequestR
 	id := record.ID
 	if id == "" {
 		id = fmt.Sprintf("%d", time.Now().UnixNano())
+	} else if record.IsSimulated {
+		// "sim-20260227T174103-1a1aaf40" → "1a1aaf40"
+		if idx := strings.LastIndex(id, "-"); idx >= 0 {
+			id = id[idx+1:]
+		}
 	}
 
 	return fmt.Sprintf("%s%s-%s-%s%s", detailedFilePrefix, sanitized, timestamp, id, detailedFileSuffix)
@@ -473,11 +647,19 @@ func (dl *DetailedRequestLogger) cleanupOldFiles() {
 	dl.RebuildIndex()
 }
 
-// isMetaFile checks if a filename is a meta file (not a bodies companion file).
+// isMetaFile checks if a filename is a completed meta file
+// (not a bodies companion or a pending placeholder).
 func isMetaFile(name string) bool {
 	return strings.HasPrefix(name, detailedFilePrefix) &&
 		strings.HasSuffix(name, detailedFileSuffix) &&
-		!strings.HasSuffix(name, detailedBodiesSuffix)
+		!strings.HasSuffix(name, detailedBodiesSuffix) &&
+		!strings.HasSuffix(name, detailedPendingSuffix)
+}
+
+// isPendingFile checks if a filename is a pending placeholder file.
+func isPendingFile(name string) bool {
+	return strings.HasPrefix(name, detailedFilePrefix) &&
+		strings.HasSuffix(name, detailedPendingSuffix)
 }
 
 // listDetailFiles returns all meta detail-*.json files sorted by mod time (newest first).
@@ -512,6 +694,29 @@ func (dl *DetailedRequestLogger) listDetailFiles() ([]os.DirEntry, error) {
 	})
 
 	return detailFiles, nil
+}
+
+// listPendingFiles returns all .pending.json files sorted newest first.
+func (dl *DetailedRequestLogger) listPendingFiles() []os.DirEntry {
+	entries, err := os.ReadDir(dl.logsDir)
+	if err != nil {
+		return nil
+	}
+	var pending []os.DirEntry
+	for _, entry := range entries {
+		if !entry.IsDir() && isPendingFile(entry.Name()) {
+			pending = append(pending, entry)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		infoI, errI := pending[i].Info()
+		infoJ, errJ := pending[j].Info()
+		if errI != nil || errJ != nil {
+			return pending[i].Name() > pending[j].Name()
+		}
+		return infoI.ModTime().After(infoJ.ModTime())
+	})
+	return pending
 }
 
 // readRecordFromFile reads and parses a single detail JSON file.
@@ -680,6 +885,8 @@ func applyIndexFilters(entries []IndexEntry, filter RecordFilter) []IndexEntry {
 // ReadRecordSummaries returns paginated summaries using the index file.
 // Records with IDs in knownIDs are returned as cached stubs ({id, cached: true})
 // instead of reading the meta file from disk.
+// Pending (in-flight) records are prepended before completed records and
+// deduplicated: if a completed version exists, the pending file is skipped.
 func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter, knownIDs map[string]bool) ([]any, int, error) {
 	index, err := dl.loadIndex()
 	if err != nil || index == nil {
@@ -688,26 +895,62 @@ func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter, knownI
 		}
 		index, _ = dl.loadIndex()
 		if index == nil {
-			return []any{}, 0, nil
+			index = []IndexEntry{}
 		}
 	}
 
-	filtered := applyIndexFilters(index, filter)
-	total := len(filtered)
+	// Build set of completed IDs for deduplication.
+	completedIDs := make(map[string]bool, len(index))
+	for _, e := range index {
+		completedIDs[e.ID] = true
+	}
 
-	if filter.Offset > 0 {
-		if filter.Offset >= len(filtered) {
-			filtered = nil
-		} else {
-			filtered = filtered[filter.Offset:]
+	// Scan pending files (typically 0–5 in-flight requests).
+	pendingFiles := dl.listPendingFiles()
+	var pendingSummaries []DetailedRequestSummary
+	for _, pf := range pendingFiles {
+		rec, errRead := dl.readRecordFromFile(pf.Name())
+		if errRead != nil {
+			continue
+		}
+		if completedIDs[rec.ID] {
+			continue
+		}
+		pendingSummaries = append(pendingSummaries, rec.ToSummary())
+	}
+
+	filteredIndex := applyIndexFilters(index, filter)
+	pendingCount := len(pendingSummaries)
+	completedCount := len(filteredIndex)
+	total := pendingCount + completedCount
+
+	// Paginate across the virtual list: [pending...] + [completed...]
+	offset := filter.Offset
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = total
+	}
+
+	results := make([]any, 0, limit)
+
+	// Pending records occupy the first pendingCount slots.
+	if offset < pendingCount {
+		end := pendingCount
+		if end > offset+limit {
+			end = offset + limit
+		}
+		for i := offset; i < end; i++ {
+			results = append(results, pendingSummaries[i])
 		}
 	}
-	if filter.Limit > 0 && len(filtered) > filter.Limit {
-		filtered = filtered[:filter.Limit]
-	}
 
-	results := make([]any, 0, len(filtered))
-	for _, entry := range filtered {
+	// Completed records start after the pending block.
+	completedStart := 0
+	if offset > pendingCount {
+		completedStart = offset - pendingCount
+	}
+	for i := completedStart; i < completedCount && len(results) < limit; i++ {
+		entry := filteredIndex[i]
 		if len(knownIDs) > 0 && knownIDs[entry.ID] {
 			results = append(results, map[string]any{"id": entry.ID, "cached": true})
 		} else {
@@ -718,6 +961,7 @@ func (dl *DetailedRequestLogger) ReadRecordSummaries(filter RecordFilter, knownI
 			results = append(results, record.ToSummary())
 		}
 	}
+
 	return results, total, nil
 }
 
@@ -735,6 +979,7 @@ func (dl *DetailedRequestLogger) readBodiesFromFile(filename string) (*DetailedR
 }
 
 // ReadRecordByID reads a single full record (meta + bodies) by its ID.
+// Completed meta files are preferred; pending files are used as fallback.
 func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestRecord, error) {
 	entries, err := os.ReadDir(dl.logsDir)
 	if err != nil {
@@ -744,26 +989,34 @@ func (dl *DetailedRequestLogger) ReadRecordByID(id string) (*DetailedRequestReco
 		return nil, fmt.Errorf("failed to read logs directory: %w", err)
 	}
 
+	var pendingMatch string
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if !isMetaFile(name) {
-			continue
-		}
 		if !strings.Contains(name, id) {
 			continue
 		}
-		record, errRead := dl.readRecordFromFile(name)
-		if errRead != nil {
-			continue
-		}
-		if record.ID == id {
+		if isMetaFile(name) {
+			record, errRead := dl.readRecordFromFile(name)
+			if errRead != nil || record.ID != id {
+				continue
+			}
 			bodiesName := strings.TrimSuffix(name, detailedFileSuffix) + detailedBodiesSuffix
 			if bodies, errBodies := dl.readBodiesFromFile(bodiesName); errBodies == nil {
 				mergeBodies(record, bodies)
 			}
+			return record, nil
+		}
+		if isPendingFile(name) {
+			pendingMatch = name
+		}
+	}
+
+	if pendingMatch != "" {
+		record, errRead := dl.readRecordFromFile(pendingMatch)
+		if errRead == nil && record.ID == id {
 			return record, nil
 		}
 	}

@@ -186,6 +186,7 @@ func isTokenError(msg string) bool {
 		"expired key",
 		"invalid credential",
 		"invalid authorization",
+		"invalid_grant",
 	}
 	for _, kw := range tokenKeywords {
 		if strings.Contains(msg, kw) {

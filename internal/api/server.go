@@ -27,7 +27,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	unifiedrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/unified-routing"
-	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -369,7 +368,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/completions", s.wrapWithUnifiedRouting(openaiHandlers.Completions))
 		v1.POST("/messages", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeMessages))
 		v1.POST("/messages/count_tokens", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeCountTokens))
-		v1.POST("/responses", s.wrapWithUnifiedRouting(openaiResponsesHandlers.Responses))
+		v1.POST("/responses", s.wrapWithUnifiedRoutingFormat(openaiResponsesHandlers.Responses, sdktranslator.FormatOpenAIResponse, "model"))
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
@@ -1061,6 +1060,8 @@ func (s *Server) wrapWithUnifiedRoutingClaude(originalHandler gin.HandlerFunc) g
 // wrapWithUnifiedRoutingFormat wraps an API handler with unified routing support for a specific format.
 func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, sourceFormat sdktranslator.Format, modelField string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sourceFormat)})
+
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {
 			originalHandler(c)
@@ -1080,6 +1081,31 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 			return
 		}
 
+		// Validate request body against the endpoint's expected format.
+		// If the body doesn't match, auto-correct to the detected format.
+		result := validateAndCorrectFormat(rawBody, sourceFormat)
+		if !result.valid {
+			c.Set(ginKeyFormatInfo, logging.FormatInfo{
+				EndpointFormat: string(sourceFormat),
+				HasError:       true,
+			})
+			c.JSON(result.httpStatus, gin.H{
+				"error": gin.H{
+					"message": result.errorMessage,
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+		if result.wasCorrected {
+			c.Set(ginKeyFormatInfo, logging.FormatInfo{
+				EndpointFormat: string(sourceFormat),
+				DetectedFormat: string(result.correctedFormat),
+				WasCorrected:   true,
+			})
+		}
+		effectiveFormat := result.correctedFormat
+
 		// Extract model from request
 		modelName := gjson.GetBytes(rawBody, modelField).String()
 		if modelName == "" {
@@ -1093,19 +1119,12 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 
 		if routeErr == nil {
 			// Model is a route alias - execute with full failover support
-			log.Debugf("[UnifiedRouting] Routing request for model: %s (format: %s)", modelName, sourceFormat)
+			log.Debugf("[UnifiedRouting] Routing request for model: %s (format: %s)", modelName, effectiveFormat)
 
 			stream := gjson.GetBytes(rawBody, "stream").Bool()
 
-			// Normalize OpenAI Responses-format payloads (with "input" instead of "messages")
-			// to Chat Completions format so downstream translators can process them correctly.
-			if sourceFormat == sdktranslator.FormatOpenAI {
-				rawBody = normalizeResponsesFormat(rawBody, modelName, stream)
-				stream = gjson.GetBytes(rawBody, "stream").Bool()
-			}
-
 			// Use ExecuteWithFailover for full multi-layer failover support
-			s.executeWithUnifiedRoutingFailoverFormat(c, engine, modelName, rawBody, stream, sourceFormat)
+			s.executeWithUnifiedRoutingFailoverFormat(c, engine, modelName, rawBody, stream, effectiveFormat)
 			return
 		}
 
@@ -1133,6 +1152,8 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 // Gemini format has the model name in the URL path (e.g., /v1beta/models/gemini-pro:generateContent)
 func (s *Server) wrapWithUnifiedRoutingGemini(originalHandler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGemini)})
+
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {
 			originalHandler(c)
@@ -1209,6 +1230,8 @@ func (s *Server) wrapWithUnifiedRoutingGemini(originalHandler gin.HandlerFunc) g
 // The method is determined by the URL path (e.g., /v1internal:generateContent, /v1internal:streamGenerateContent)
 func (s *Server) wrapWithUnifiedRoutingGeminiCLI(originalHandler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGeminiCLI)})
+
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {
 			originalHandler(c)
@@ -1849,19 +1872,3 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	}
 }
 
-// normalizeResponsesFormat converts OpenAI Responses-format payloads (with "input"
-// instead of "messages") to standard Chat Completions format so that downstream
-// translators can process them correctly. If the payload already uses "messages",
-// it is returned unchanged.
-func normalizeResponsesFormat(rawBody []byte, modelName string, stream bool) []byte {
-	// Same detection logic as openai_handlers.shouldTreatAsResponsesFormat:
-	// If "messages" exists, it's already in Chat Completions format.
-	if gjson.GetBytes(rawBody, "messages").Exists() {
-		return rawBody
-	}
-	// If "input" or "instructions" exists (without "messages"), treat as Responses format.
-	if gjson.GetBytes(rawBody, "input").Exists() || gjson.GetBytes(rawBody, "instructions").Exists() {
-		return responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawBody, stream)
-	}
-	return rawBody
-}
