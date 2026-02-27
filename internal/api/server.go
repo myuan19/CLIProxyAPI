@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/compat"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	unifiedrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/unified-routing"
@@ -49,6 +50,8 @@ import (
 )
 
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+
+const ginKeyFormatInfo = "FORMAT_DETECTION_INFO"
 
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
@@ -364,7 +367,7 @@ func (s *Server) setupRoutes() {
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		// Wrap handlers with unified routing support
-		v1.POST("/chat/completions", s.wrapWithUnifiedRouting(openaiHandlers.ChatCompletions))
+		v1.POST("/chat/completions", compat.Middleware(compat.ChatCompletionsRules), s.wrapWithUnifiedRouting(openaiHandlers.ChatCompletions))
 		v1.POST("/completions", s.wrapWithUnifiedRouting(openaiHandlers.Completions))
 		v1.POST("/messages", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeMessages))
 		v1.POST("/messages/count_tokens", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeCountTokens))
@@ -1081,31 +1084,6 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 			return
 		}
 
-		// Validate request body against the endpoint's expected format.
-		// If the body doesn't match, auto-correct to the detected format.
-		result := validateAndCorrectFormat(rawBody, sourceFormat)
-		if !result.valid {
-			c.Set(ginKeyFormatInfo, logging.FormatInfo{
-				EndpointFormat: string(sourceFormat),
-				HasError:       true,
-			})
-			c.JSON(result.httpStatus, gin.H{
-				"error": gin.H{
-					"message": result.errorMessage,
-					"type":    "invalid_request_error",
-				},
-			})
-			return
-		}
-		if result.wasCorrected {
-			c.Set(ginKeyFormatInfo, logging.FormatInfo{
-				EndpointFormat: string(sourceFormat),
-				DetectedFormat: string(result.correctedFormat),
-				WasCorrected:   true,
-			})
-		}
-		effectiveFormat := result.correctedFormat
-
 		// Extract model from request
 		modelName := gjson.GetBytes(rawBody, modelField).String()
 		if modelName == "" {
@@ -1119,12 +1097,12 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 
 		if routeErr == nil {
 			// Model is a route alias - execute with full failover support
-			log.Debugf("[UnifiedRouting] Routing request for model: %s (format: %s)", modelName, effectiveFormat)
+			log.Debugf("[UnifiedRouting] Routing request for model: %s (format: %s)", modelName, sourceFormat)
 
 			stream := gjson.GetBytes(rawBody, "stream").Bool()
 
 			// Use ExecuteWithFailover for full multi-layer failover support
-			s.executeWithUnifiedRoutingFailoverFormat(c, engine, modelName, rawBody, stream, effectiveFormat)
+			s.executeWithUnifiedRoutingFailoverFormat(c, engine, modelName, rawBody, stream, sourceFormat)
 			return
 		}
 

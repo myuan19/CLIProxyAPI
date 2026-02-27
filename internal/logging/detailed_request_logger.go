@@ -47,12 +47,11 @@ const (
 	cleanupInterval = 20
 )
 
-// FormatInfo holds the format detection/correction result for a request.
+// FormatInfo holds the endpoint format and optional compatibility-layer info for a request.
 type FormatInfo struct {
 	EndpointFormat string `json:"endpoint_format"`
-	DetectedFormat string `json:"detected_format,omitempty"`
-	WasCorrected   bool   `json:"was_corrected,omitempty"`
-	HasError       bool   `json:"has_error,omitempty"`
+	CompatApplied  bool   `json:"compat_applied,omitempty"`
+	CompatRule     string `json:"compat_rule,omitempty"`
 }
 
 // DetailedRequestRecord represents a single proxied request with all retry attempts.
