@@ -1,77 +1,106 @@
-// Package compat provides a request body compatibility layer as Gin middleware.
+// Package compat provides a request-body compatibility layer as Gin middleware.
 //
-// Some clients send request bodies in a format that doesn't match the endpoint they hit.
-// For example, Cursor may send OpenAI Responses-format payloads (with "input") to the
-// Chat Completions endpoint (which expects "messages"). Rather than rejecting these
-// requests, the compat middleware transparently converts the body before downstream
-// handlers see it.
+// When a client sends a request body whose format doesn't match the endpoint it hits
+// (e.g. Claude-format body to /v1/chat/completions), the middleware transparently
+// converts the body to the endpoint's expected format using the translator registry.
 //
-// Rules are defined declaratively and attached to specific routes, keeping handler code
-// completely unaware of the compatibility logic.
+// The endpoint is always treated as the source of truth: the body adapts, not the route.
 package compat
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 
 	"github.com/gin-gonic/gin"
-	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
-// ContextKey is the Gin context key where the applied rule name is stored.
+// ContextKey is the Gin context key where the applied conversion name is stored.
 const ContextKey = "COMPAT_APPLIED"
 
-// Rule describes a single body-level compatibility conversion.
-type Rule struct {
-	Name      string
-	Condition func(body []byte) bool
-	Transform func(body []byte) []byte
-}
+// DetectBodyFormat inspects a raw JSON body and returns the most likely API format.
+// Returns empty string if the format cannot be determined.
+func DetectBodyFormat(body []byte) sdktranslator.Format {
+	hasMessages := gjson.GetBytes(body, "messages").Exists()
+	hasInput := gjson.GetBytes(body, "input").Exists()
+	hasContents := gjson.GetBytes(body, "contents").Exists()
 
-// ChatCompletionsRules are the compatibility rules for the /v1/chat/completions endpoint.
-var ChatCompletionsRules = []Rule{
-	{
-		Name: "input-to-messages",
-		Condition: func(body []byte) bool {
-			return !gjson.GetBytes(body, "messages").Exists() &&
-				gjson.GetBytes(body, "input").Exists()
-		},
-		Transform: func(body []byte) []byte {
-			model := gjson.GetBytes(body, "model").String()
-			stream := gjson.GetBytes(body, "stream").Bool()
-			return responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(model, body, stream)
-		},
-	},
-}
+	// Gemini: has "contents", no "messages"
+	if hasContents && !hasMessages {
+		return sdktranslator.FormatGemini
+	}
 
-// Middleware returns a Gin handler that applies the first matching Rule to the
-// request body and stores the rule name in the Gin context under ContextKey.
-// If no rule matches, the body passes through unchanged.
-func Middleware(rules []Rule) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if len(rules) == 0 {
-			c.Next()
-			return
+	// OpenAI Responses: has "input", no "messages"
+	if hasInput && !hasMessages {
+		return sdktranslator.FormatOpenAIResponse
+	}
+
+	// Both Claude and OpenAI use "messages"; distinguish by Claude-only fields.
+	if hasMessages {
+		if isClaudeBody(body) {
+			return sdktranslator.FormatClaude
 		}
+		return sdktranslator.FormatOpenAI
+	}
 
+	return ""
+}
+
+// isClaudeBody returns true if the body contains fields specific to the Anthropic
+// Messages API that are absent from OpenAI Chat Completions.
+func isClaudeBody(body []byte) bool {
+	// "system" as a top-level JSON array is Claude-only; OpenAI puts system in messages.
+	if s := gjson.GetBytes(body, "system"); s.Exists() && s.IsArray() {
+		return true
+	}
+
+	// "stop_sequences" is Claude; OpenAI uses "stop".
+	if gjson.GetBytes(body, "stop_sequences").Exists() {
+		return true
+	}
+
+	// Tools with "input_schema" are Claude; OpenAI nests under "function.parameters".
+	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
+		first := tools.Array()
+		if len(first) > 0 && first[0].Get("input_schema").Exists() {
+			return true
+		}
+	}
+
+	return false
+}
+
+// AutoCompat returns a Gin middleware that detects the request body format and, if
+// it doesn't match endpointFormat, translates the body using the translator registry.
+// The conversion name (e.g. "claude-to-openai") is stored under ContextKey.
+func AutoCompat(endpointFormat sdktranslator.Format) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		rawBody, err := io.ReadAll(c.Request.Body)
 		if err != nil || len(rawBody) == 0 {
 			c.Next()
 			return
 		}
 
-		for _, rule := range rules {
-			if rule.Condition(rawBody) {
-				rawBody = rule.Transform(rawBody)
-				c.Set(ContextKey, rule.Name)
-				log.Debugf("[Compat] Applied rule %q", rule.Name)
-				break
-			}
+		detected := DetectBodyFormat(rawBody)
+
+		if detected == "" || detected == endpointFormat {
+			c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+			c.Next()
+			return
 		}
 
-		c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+		model := gjson.GetBytes(rawBody, "model").String()
+		stream := gjson.GetBytes(rawBody, "stream").Bool()
+		converted := sdktranslator.TranslateRequest(detected, endpointFormat, model, rawBody, stream)
+
+		ruleName := fmt.Sprintf("%s-to-%s", detected, endpointFormat)
+		c.Set(ContextKey, ruleName)
+		log.Debugf("[Compat] %s", ruleName)
+
+		c.Request.Body = io.NopCloser(bytes.NewReader(converted))
 		c.Next()
 	}
 }

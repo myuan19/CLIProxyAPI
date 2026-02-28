@@ -366,12 +366,13 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
-		// Wrap handlers with unified routing support
-		v1.POST("/chat/completions", compat.Middleware(compat.ChatCompletionsRules), s.wrapWithUnifiedRouting(openaiHandlers.ChatCompletions))
+		// Wrap handlers with unified routing support.
+		// AutoCompat detects body format mismatches and translates the body to match the endpoint.
+		v1.POST("/chat/completions", compat.AutoCompat(sdktranslator.FormatOpenAI), s.wrapWithUnifiedRouting(openaiHandlers.ChatCompletions))
 		v1.POST("/completions", s.wrapWithUnifiedRouting(openaiHandlers.Completions))
-		v1.POST("/messages", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeMessages))
+		v1.POST("/messages", compat.AutoCompat(sdktranslator.FormatClaude), s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeMessages))
 		v1.POST("/messages/count_tokens", s.wrapWithUnifiedRoutingClaude(claudeCodeHandlers.ClaudeCountTokens))
-		v1.POST("/responses", s.wrapWithUnifiedRoutingFormat(openaiResponsesHandlers.Responses, sdktranslator.FormatOpenAIResponse, "model"))
+		v1.POST("/responses", compat.AutoCompat(sdktranslator.FormatOpenAIResponse), s.wrapWithUnifiedRoutingFormat(openaiResponsesHandlers.Responses, sdktranslator.FormatOpenAIResponse, "model"))
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
