@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/compat"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/tidwall/gjson"
 )
@@ -147,19 +148,10 @@ func DetailedRequestLoggingMiddleware(logger *logging.DetailedRequestLogger) gin
 		// 重试部分：从 Gin 上下文中记录各次上游请求/响应（由 executor 在 DetailedRequestLog 开启时写入）
 		record.Attempts = extractAttempts(c)
 
-		// Extract format and compatibility info
-		if fmtRaw, exists := c.Get("FORMAT_DETECTION_INFO"); exists {
+		// Extract format and compatibility info (single key, set by routing wrapper + compat middleware).
+		if fmtRaw, exists := c.Get(compat.FormatInfoKey); exists {
 			if fmtInfo, ok := fmtRaw.(logging.FormatInfo); ok {
 				record.Format = &fmtInfo
-			}
-		}
-		if compatRaw, exists := c.Get("COMPAT_APPLIED"); exists {
-			if ruleName, ok := compatRaw.(string); ok && ruleName != "" {
-				if record.Format == nil {
-					record.Format = &logging.FormatInfo{}
-				}
-				record.Format.CompatApplied = true
-				record.Format.CompatRule = ruleName
 			}
 		}
 

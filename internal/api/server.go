@@ -51,8 +51,6 @@ import (
 
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
 
-const ginKeyFormatInfo = "FORMAT_DETECTION_INFO"
-
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
 	engineConfigurator   func(*gin.Engine)
@@ -1064,7 +1062,7 @@ func (s *Server) wrapWithUnifiedRoutingClaude(originalHandler gin.HandlerFunc) g
 // wrapWithUnifiedRoutingFormat wraps an API handler with unified routing support for a specific format.
 func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, sourceFormat sdktranslator.Format, modelField string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sourceFormat)})
+		c.Set(compat.FormatInfoKey, logging.FormatInfo{EndpointFormat: string(sourceFormat)})
 
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {
@@ -1131,7 +1129,7 @@ func (s *Server) wrapWithUnifiedRoutingFormat(originalHandler gin.HandlerFunc, s
 // Gemini format has the model name in the URL path (e.g., /v1beta/models/gemini-pro:generateContent)
 func (s *Server) wrapWithUnifiedRoutingGemini(originalHandler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGemini)})
+		c.Set(compat.FormatInfoKey, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGemini)})
 
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {
@@ -1209,7 +1207,7 @@ func (s *Server) wrapWithUnifiedRoutingGemini(originalHandler gin.HandlerFunc) g
 // The method is determined by the URL path (e.g., /v1internal:generateContent, /v1internal:streamGenerateContent)
 func (s *Server) wrapWithUnifiedRoutingGeminiCLI(originalHandler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Set(ginKeyFormatInfo, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGeminiCLI)})
+		c.Set(compat.FormatInfoKey, logging.FormatInfo{EndpointFormat: string(sdktranslator.FormatGeminiCLI)})
 
 		// Skip if unified routing module is not configured
 		if s.unifiedRoutingModule == nil {

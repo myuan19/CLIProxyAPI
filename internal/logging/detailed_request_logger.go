@@ -52,6 +52,7 @@ type FormatInfo struct {
 	EndpointFormat string `json:"endpoint_format"`
 	CompatApplied  bool   `json:"compat_applied,omitempty"`
 	CompatRule     string `json:"compat_rule,omitempty"`
+	CompatError    string `json:"compat_error,omitempty"`
 }
 
 // DetailedRequestRecord represents a single proxied request with all retry attempts.
