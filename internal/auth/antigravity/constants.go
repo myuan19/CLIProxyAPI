@@ -28,7 +28,9 @@ const (
 const (
 	APIEndpoint    = "https://cloudcode-pa.googleapis.com"
 	APIVersion     = "v1internal"
-	APIUserAgent   = "google-api-nodejs-client/9.15.1"
-	APIClient      = "google-cloud-sdk vscode_cloudshelleditor/0.1"
-	ClientMetadata = `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
+	APIUserAgent   = "antigravity/" + IDEVersion
+	APIClient      = "gl-node/22.20.0 grpc-node/1.12.6 gax-node/4.8.0 gapic/1.107.0 antigravity/1.107.0"
+	ClientMetadata = `{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
+	IDEVersion     = "1.107.0"
+	ExtensionName  = "google.antigravity"
 )

@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,7 +46,9 @@ const (
 	antigravityModelsPath          = "/v1internal:fetchAvailableModels"
 	antigravityClientID            = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	antigravityClientSecret        = "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"
-	defaultAntigravityAgent        = "antigravity/1.104.0 darwin/arm64"
+	defaultAntigravityAgent        = "antigravity/1.107.0"
+	antigravityXGoogAPIClient      = "gl-node/22.20.0 grpc-node/1.12.6 gax-node/4.8.0 gapic/1.107.0 antigravity/1.107.0"
+	antigravityClientMetadata      = `ideType=ANTIGRAVITY,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI`
 	antigravityAuthType            = "antigravity"
 	refreshSkew                    = 3000 * time.Second
 	systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
@@ -920,6 +923,8 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		httpReq.Header.Set("X-Goog-Api-Client", antigravityXGoogAPIClient)
+		httpReq.Header.Set("Client-Metadata", antigravityClientMetadata)
 		httpReq.Header.Set("Accept", "application/json")
 		if host := resolveHost(base); host != "" {
 			httpReq.Host = host
@@ -1025,6 +1030,8 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		httpReq.Header.Set("X-Goog-Api-Client", antigravityXGoogAPIClient)
+		httpReq.Header.Set("Client-Metadata", antigravityClientMetadata)
 		if host := resolveHost(baseURL); host != "" {
 			httpReq.Host = host
 		}
@@ -1154,7 +1161,7 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 		return auth, errReq
 	}
 	httpReq.Header.Set("Host", "oauth2.googleapis.com")
-	httpReq.Header.Set("User-Agent", defaultAntigravityAgent)
+	httpReq.Header.Set("User-Agent", defaultAntigravityAgent+" "+goRuntimePlatform())
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -1279,7 +1286,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 			projectID = strings.TrimSpace(pid)
 		}
 	}
-	payload = geminiToAntigravity(modelName, payload, projectID)
+	payload = geminiToAntigravity(modelName, payload, projectID, auth)
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro-high")
@@ -1322,6 +1329,8 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+	httpReq.Header.Set("X-Goog-Api-Client", antigravityXGoogAPIClient)
+	httpReq.Header.Set("Client-Metadata", antigravityClientMetadata)
 	if stream {
 		httpReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -1445,7 +1454,25 @@ func resolveUserAgent(auth *cliproxyauth.Auth) string {
 			}
 		}
 	}
-	return defaultAntigravityAgent
+	return defaultAntigravityAgent + " " + goRuntimePlatform()
+}
+
+func goRuntimePlatform() string {
+	os := goruntime.GOOS
+	arch := goruntime.GOARCH
+	switch os {
+	case "windows":
+		os = "win32"
+	case "darwin":
+		os = "darwin"
+	}
+	switch arch {
+	case "amd64":
+		arch = "x64"
+	case "arm64":
+		arch = "arm64"
+	}
+	return os + "/" + arch
 }
 
 func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
@@ -1509,9 +1536,9 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
 		return []string{base}
 	}
 	return []string{
+		antigravityBaseURLProd,
 		antigravityBaseURLDaily,
 		antigravitySandboxBaseURLDaily,
-		// antigravityBaseURLProd,
 	}
 }
 
@@ -1535,12 +1562,11 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
-func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
+func geminiToAntigravity(modelName string, payload []byte, projectID string, _ *cliproxyauth.Auth) []byte {
 	template, _ := sjson.Set(string(payload), "model", modelName)
 	template, _ = sjson.Set(template, "userAgent", "antigravity")
 	template, _ = sjson.Set(template, "requestType", "agent")
 
-	// Use real project ID from auth if available, otherwise generate random (legacy fallback)
 	if projectID != "" {
 		template, _ = sjson.Set(template, "project", projectID)
 	} else {
