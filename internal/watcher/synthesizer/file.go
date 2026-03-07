@@ -63,6 +63,9 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		if provider == "gemini" {
 			provider = "gemini-cli"
 		}
+		if provider == "antigravity-mitm" {
+			provider = "antigravity"
+		}
 		label := provider
 		if email, _ := metadata["email"].(string); email != "" {
 			label = email

@@ -12,7 +12,9 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -80,7 +82,7 @@ func (m *Manager) CACertPath() (string, error) {
 func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	host := hello.ServerName
 	if host == "" {
-		host = "localhost"
+		host = "127.0.0.1"
 	}
 
 	m.mu.RLock()
@@ -253,16 +255,23 @@ func extractSystemPEMs(pool *x509.CertPool) [][]byte {
 		return nil
 	}
 	var pems [][]byte
-	for _, s := range pool.Subjects() { //nolint:staticcheck
-		_ = s // we iterate to get a count but can't extract PEM from Subjects()
+
+	// Try platform-specific certificate bundle locations.
+	bundlePaths := []string{
+		"/etc/ssl/certs/ca-certificates.crt",   // Debian/Ubuntu
+		"/etc/pki/tls/certs/ca-bundle.crt",     // RHEL/CentOS
+		"/etc/ssl/cert.pem",                     // Alpine/macOS
 	}
-	// The standard library doesn't expose individual PEM blocks from the pool.
-	// Instead, we rely on the system's default bundle file.
-	for _, path := range []string{
-		"/etc/ssl/certs/ca-certificates.crt",
-		"/etc/pki/tls/certs/ca-bundle.crt",
-		"/etc/ssl/cert.pem",
-	} {
+
+	// On Windows, export system root certificates programmatically.
+	if runtime.GOOS == "windows" {
+		if exported := exportWindowsRootCerts(); len(exported) > 0 {
+			pems = append(pems, exported)
+			return pems
+		}
+	}
+
+	for _, path := range bundlePaths {
 		data, err := os.ReadFile(path)
 		if err == nil && len(data) > 0 {
 			pems = append(pems, data)
@@ -270,4 +279,20 @@ func extractSystemPEMs(pool *x509.CertPool) [][]byte {
 		}
 	}
 	return pems
+}
+
+// exportWindowsRootCerts exports system root certificates as PEM on Windows
+// by invoking PowerShell to enumerate the cert store.
+func exportWindowsRootCerts() []byte {
+	script := `Get-ChildItem -Path Cert:\LocalMachine\Root | ForEach-Object {
+		$b64 = [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+		"-----BEGIN CERTIFICATE-----"
+		$b64
+		"-----END CERTIFICATE-----"
+	}`
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", script).Output()
+	if err != nil || len(out) == 0 {
+		return nil
+	}
+	return out
 }

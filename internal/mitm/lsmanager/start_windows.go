@@ -5,6 +5,7 @@ package lsmanager
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 
@@ -23,9 +24,11 @@ func (m *Manager) startWithDLLInjection(ctx context.Context, lsPath string) (*ex
 		return nil, fmt.Errorf("lsmanager: redirect lib path required for Windows DLL injection")
 	}
 
-	cmd := exec.CommandContext(ctx, lsPath, "--stdio", "--health_check")
+	cmd := exec.CommandContext(ctx, lsPath, m.buildArgs()...)
 	cmd.Dir = m.cfg.DataDir
 	cmd.Env = m.buildEnv()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	const createSuspended = 0x00000004
 	cmd.SysProcAttr = &syscall.SysProcAttr{

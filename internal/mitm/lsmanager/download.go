@@ -1,7 +1,9 @@
 package lsmanager
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,13 +14,13 @@ import (
 )
 
 const (
-	// Antigravity IDE distribution URLs per platform.
-	// The Language Server binary is extracted from the IDE package.
-	lsVersion = "1.19.6"
+	// ZeroGravity locks to v1.18.3 for maximum API compatibility.
+	lsVersion   = "1.18.3"
+	lsBuildID   = "4739469533380608"
+	lsFullLabel = lsVersion + "-" + lsBuildID
 
 	// Base URL pattern for the Language Server binary downloads.
-	// ZeroGravity uses edgedl.me.gvt1.com; we mirror the same pattern.
-	baseDownloadURL = "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity"
+	baseDownloadURL = "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/" + lsFullLabel
 )
 
 // binaryName returns the expected Language Server binary filename for the current OS/arch.
@@ -45,8 +47,9 @@ func antigravityExtensionBinaryPath() string {
 	return filepath.Join("resources", "app", "extensions", "antigravity", "bin", binaryName())
 }
 
-// DownloadLS downloads and extracts the Language Server binary into dir.
+// DownloadLS downloads and extracts the Language Server v1.18.3 binary into dir.
 // If the binary already exists in dir, it returns the path without downloading.
+// Falls back to local Antigravity installation if download fails.
 func DownloadLS(dir string) (string, error) {
 	dest := filepath.Join(dir, binaryName())
 	if info, err := os.Stat(dest); err == nil && info.Size() > 0 {
@@ -57,7 +60,14 @@ func DownloadLS(dir string) (string, error) {
 		return "", fmt.Errorf("lsmanager: create dir: %w", err)
 	}
 
-	// Try extracting from a local Antigravity installation first.
+	// Try downloading the exact v1.18.3 binary from Google's CDN.
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		if p, err := downloadFromCDN(dir); err == nil {
+			return p, nil
+		}
+	}
+
+	// Fall back to local Antigravity installation.
 	if p, err := findLocalLS(); err == nil {
 		if err := copyFile(p, dest); err == nil {
 			if err := os.Chmod(dest, 0o755); err == nil {
@@ -67,6 +77,44 @@ func DownloadLS(dir string) (string, error) {
 	}
 
 	return "", fmt.Errorf("lsmanager: Language Server binary not found; please provide ls_path in config or place %s in %s", binaryName(), dir)
+}
+
+func downloadFromCDN(dir string) (string, error) {
+	var platform string
+	switch runtime.GOOS {
+	case "linux":
+		if runtime.GOARCH == "arm64" {
+			platform = "linux-arm"
+		} else {
+			platform = "linux-x64"
+		}
+	case "darwin":
+		if runtime.GOARCH == "arm64" {
+			platform = "darwin-arm64"
+		} else {
+			platform = "darwin-x64"
+		}
+	default:
+		return "", fmt.Errorf("CDN download not supported on %s", runtime.GOOS)
+	}
+
+	archiveURL := fmt.Sprintf("%s/%s/Antigravity.tar.gz", baseDownloadURL, platform)
+	archivePath := filepath.Join(dir, "antigravity.tar.gz")
+
+	if err := downloadFile(archiveURL, archivePath); err != nil {
+		return "", fmt.Errorf("lsmanager: download archive: %w", err)
+	}
+	defer os.Remove(archivePath)
+
+	dest := filepath.Join(dir, binaryName())
+	if err := extractFromTarGz(archivePath, antigravityExtensionBinaryPath(), dest); err != nil {
+		return "", fmt.Errorf("lsmanager: extract: %w", err)
+	}
+
+	if err := os.Chmod(dest, 0o755); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 // findLocalLS searches common Antigravity installation directories.
@@ -172,6 +220,44 @@ func downloadFile(url, dest string) error {
 
 	_, err = io.Copy(f, resp.Body)
 	return err
+}
+
+// extractFromTarGz extracts a single file from a .tar.gz archive.
+func extractFromTarGz(archivePath, entryPath, destPath string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(hdr.Name, entryPath) || hdr.Name == entryPath {
+			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			return out.Close()
+		}
+	}
+	return fmt.Errorf("entry %q not found in archive", entryPath)
 }
 
 func copyFile(src, dst string) error {

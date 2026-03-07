@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -60,12 +61,14 @@ type Config struct {
 // Proxy is an HTTP/2 MITM proxy that intercepts TLS connections from
 // a Language Server and forwards them to the real Google API.
 type Proxy struct {
-	cfg      Config
-	listener net.Listener
-	server   *http.Server
-	port     int32
-	wg       sync.WaitGroup
-	closed   atomic.Bool
+	cfg           Config
+	listener      net.Listener
+	server        *http.Server
+	port          int32
+	wg            sync.WaitGroup
+	closed        atomic.Bool
+	transport     http.RoundTripper
+	transportOnce sync.Once
 }
 
 // New creates a new MITM proxy with the given configuration.
@@ -276,13 +279,15 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, body []byte) (*http.Reques
 		url += "?" + r.URL.RawQuery
 	}
 
-	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, url, io.NopCloser(strings.NewReader(string(body))))
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, url, io.NopCloser(bytes.NewReader(body)))
 	if err != nil {
 		return nil, err
 	}
 
 	for k, vv := range r.Header {
-		if strings.EqualFold(k, "Host") {
+		kl := strings.ToLower(k)
+		if kl == "host" || kl == "connection" || kl == "transfer-encoding" ||
+			kl == "te" || kl == "trailer" || kl == "upgrade" {
 			continue
 		}
 		for _, v := range vv {
@@ -296,8 +301,11 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, body []byte) (*http.Reques
 }
 
 func (p *Proxy) upstreamTransport() http.RoundTripper {
-	host := strings.Split(p.cfg.TargetHost, ":")[0]
-	return NewUTLSTransport(p.cfg.H2Profile, host)
+	p.transportOnce.Do(func() {
+		host := strings.Split(p.cfg.TargetHost, ":")[0]
+		p.transport = NewUTLSTransport(p.cfg.H2Profile, host)
+	})
+	return p.transport
 }
 
 func isStreamingRequest(r *http.Request) bool {

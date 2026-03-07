@@ -408,9 +408,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 			s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, a.ID, s.wsGateway))
 		}
 		return
-	case "antigravity":
-		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
-	case "antigravity-mitm":
+	case "antigravity", "antigravity-mitm":
 		s.coreManager.RegisterExecutor(executor.NewMITMExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
@@ -802,12 +800,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "aistudio":
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
-	case "antigravity":
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
-		cancel()
-		models = applyExcludedModels(models, excluded)
-	case "antigravity-mitm":
+	case "antigravity", "antigravity-mitm":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
 		cancel()

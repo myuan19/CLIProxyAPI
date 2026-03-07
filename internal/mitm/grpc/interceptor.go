@@ -36,15 +36,61 @@ const (
 
 	// Candidate fields
 	FieldCandidateContent     = 1 // Content
-	FieldCandidateFinishReson = 2 // enum FinishReason
+	FieldCandidateFinishReason = 2 // enum FinishReason
 	FieldCandidateIndex       = 3 // int32
 )
+
+// Bidirectional tool name mapping between AG tool names and standard/client
+// tool names. In native mode, responses may contain AG-specific tool names
+// that need mapping back to client equivalents.
+var agToolNameMap = map[string]string{
+	"view_file":        "read_file",
+	"write_to_file":    "write_file",
+	"edit_file":        "edit_file",
+	"run_command":      "execute_command",
+	"search_files":     "search",
+	"list_directory":   "list_dir",
+	"browser_subagent": "browser",
+	"generate_image":   "generate_image",
+}
+
+var clientToolNameMap = map[string]string{}
+
+func init() {
+	for ag, client := range agToolNameMap {
+		clientToolNameMap[client] = ag
+	}
+}
 
 // InterceptorConfig controls the interceptor behavior.
 type InterceptorConfig struct {
 	// SystemMode: "native" (preserve LS system prompt, replace user content),
 	// "stealth" (strip Antigravity identity), "minimal" (minimal system prompt).
 	SystemMode string
+
+	// DummyPromptText is the placeholder text sent via cascade that gets
+	// replaced with the real user input in "native" mode.
+	DummyPromptText string
+
+	// SensitiveWords lists client names to obfuscate with zero-width chars
+	// to reduce detection in server-side logs (e.g. "Cursor", "OpenCode").
+	SensitiveWords []string
+}
+
+// MapToolNameToClient maps an AG tool name to its client equivalent.
+func MapToolNameToClient(agName string) string {
+	if mapped, ok := agToolNameMap[agName]; ok {
+		return mapped
+	}
+	return agName
+}
+
+// MapToolNameToAG maps a client tool name to its AG equivalent.
+func MapToolNameToAG(clientName string) string {
+	if mapped, ok := clientToolNameMap[clientName]; ok {
+		return mapped
+	}
+	return clientName
 }
 
 // PendingRequest represents a user's request waiting to be injected into
@@ -59,6 +105,10 @@ type PendingRequest struct {
 	ResponseCh     chan *InterceptedResponse
 	StreamCh       chan *StreamChunk
 	DoneCh         chan struct{}
+	finalizeOnce   sync.Once
+
+	accumulatedText  string
+	lastFinishReason string
 }
 
 // Message is a simplified chat message for injection.
@@ -109,7 +159,7 @@ func NewInterceptor(cfg InterceptorConfig) *Interceptor {
 }
 
 // InjectRequest queues a request for injection into the next LS → Google gRPC call.
-// Returns channels for receiving the response.
+// If a previous pending request exists, it is cancelled with an error.
 func (i *Interceptor) InjectRequest(req *PendingRequest) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -124,6 +174,23 @@ func (i *Interceptor) InjectRequest(req *PendingRequest) {
 		req.DoneCh = make(chan struct{})
 	}
 
+	if old := i.pendingRequest; old != nil {
+		old.finalizeOnce.Do(func() {
+			if old.ResponseCh != nil {
+				select {
+				case old.ResponseCh <- &InterceptedResponse{Error: fmt.Errorf("superseded by new request")}:
+				default:
+				}
+			}
+			if old.StreamCh != nil {
+				close(old.StreamCh)
+			}
+			if old.DoneCh != nil {
+				close(old.DoneCh)
+			}
+		})
+	}
+
 	i.pendingRequest = req
 }
 
@@ -132,6 +199,34 @@ func (i *Interceptor) HasPendingRequest() bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.pendingRequest != nil
+}
+
+// CancelPending cancels the pending (not yet activated) request with an error.
+// This should be called when the trigger fails (e.g., LS client not ready).
+func (i *Interceptor) CancelPending(err error) {
+	i.mu.Lock()
+	pending := i.pendingRequest
+	i.pendingRequest = nil
+	i.mu.Unlock()
+
+	if pending == nil {
+		return
+	}
+
+	pending.finalizeOnce.Do(func() {
+		if pending.ResponseCh != nil {
+			select {
+			case pending.ResponseCh <- &InterceptedResponse{Error: err}:
+			default:
+			}
+		}
+		if pending.StreamCh != nil {
+			close(pending.StreamCh)
+		}
+		if pending.DoneCh != nil {
+			close(pending.DoneCh)
+		}
+	})
 }
 
 // InterceptRequest processes an outgoing request from LS to Google.
@@ -194,6 +289,32 @@ func (i *Interceptor) InterceptResponse(req *http.Request, resp *http.Response, 
 		return body, nil
 	}
 
+	// Handle error responses (4xx, 5xx) by forwarding them to the pending request.
+	if resp.StatusCode >= 400 {
+		errMsg := fmt.Sprintf("upstream error %d: %s", resp.StatusCode, truncateBytes(body, 300))
+		log.WithField("status", resp.StatusCode).Warn("grpc interceptor: upstream error response")
+		active.finalizeOnce.Do(func() {
+			if active.ResponseCh != nil {
+				select {
+				case active.ResponseCh <- &InterceptedResponse{Error: fmt.Errorf(errMsg)}:
+				default:
+				}
+			}
+			if active.StreamCh != nil {
+				close(active.StreamCh)
+			}
+			if active.DoneCh != nil {
+				close(active.DoneCh)
+			}
+		})
+		i.mu.Lock()
+		if i.activeRequest == active {
+			i.activeRequest = nil
+		}
+		i.mu.Unlock()
+		return body, nil
+	}
+
 	contentType := resp.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "application/grpc") {
@@ -227,6 +348,13 @@ func (i *Interceptor) InterceptStreamChunk(req *http.Request, chunk []byte) ([]b
 		return chunk, nil
 	}
 
+	if text != "" {
+		active.accumulatedText += text
+	}
+	if finishReason != "" {
+		active.lastFinishReason = finishReason
+	}
+
 	if active.StreamCh != nil && (text != "" || finishReason != "") {
 		select {
 		case active.StreamCh <- &StreamChunk{
@@ -234,6 +362,7 @@ func (i *Interceptor) InterceptStreamChunk(req *http.Request, chunk []byte) ([]b
 			FinishReason: finishReason,
 		}:
 		default:
+			log.Warn("grpc interceptor: StreamCh full, dropping chunk")
 		}
 	}
 
@@ -245,12 +374,27 @@ func (i *Interceptor) InterceptStreamChunk(req *http.Request, chunk []byte) ([]b
 }
 
 func (i *Interceptor) finalizeActiveRequest(active *PendingRequest) {
-	if active.StreamCh != nil {
-		close(active.StreamCh)
-	}
-	if active.DoneCh != nil {
-		close(active.DoneCh)
-	}
+	active.finalizeOnce.Do(func() {
+		if active.ResponseCh != nil && active.accumulatedText != "" {
+			fr := active.lastFinishReason
+			if fr == "" {
+				fr = "STOP"
+			}
+			select {
+			case active.ResponseCh <- &InterceptedResponse{
+				Text:         active.accumulatedText,
+				FinishReason: fr,
+			}:
+			default:
+			}
+		}
+		if active.StreamCh != nil {
+			close(active.StreamCh)
+		}
+		if active.DoneCh != nil {
+			close(active.DoneCh)
+		}
+	})
 
 	i.mu.Lock()
 	if i.activeRequest == active {
@@ -329,28 +473,153 @@ func (i *Interceptor) modifyProtoBody(data []byte, pending *PendingRequest) ([]b
 }
 
 func (i *Interceptor) modifyJSONBody(body []byte, pending *PendingRequest) ([]byte, error) {
+	switch i.cfg.SystemMode {
+	case "native":
+		return i.nativeJSONReplace(body, pending)
+	default:
+		return i.fullJSONReplace(body, pending)
+	}
+}
+
+// nativeJSONReplace does a precise in-place replacement of the dummy prompt
+// while preserving the LS's full agent framework, tools, system instructions,
+// and generation config. This matches ZeroGravity's "native" approach.
+func (i *Interceptor) nativeJSONReplace(body []byte, pending *PendingRequest) ([]byte, error) {
+	var userText strings.Builder
+	for idx, msg := range pending.Messages {
+		if idx > 0 {
+			userText.WriteString("\n\n")
+		}
+		userText.WriteString(msg.Content)
+	}
+
+	replacement := userText.String()
+	if len(i.cfg.SensitiveWords) > 0 {
+		replacement = obfuscateSensitiveWords(replacement, i.cfg.SensitiveWords)
+	}
+
+	dummy := i.cfg.DummyPromptText
+	if dummy == "" {
+		dummy = "Say hello."
+	}
+
 	var req map[string]interface{}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body, nil
 	}
 
-	if pending.Model != "" {
-		req["model"] = pending.Model
+	target := req
+	if inner, ok := req["request"].(map[string]interface{}); ok {
+		target = inner
+	}
+
+	if i.replaceDummyInContents(target, dummy, replacement) {
+		mergeToolDeclarations(target)
+		enforceMaxOutputTokens(target)
+
+		modified, err := json.Marshal(req)
+		if err != nil {
+			return body, err
+		}
+		log.WithField("originalLen", len(body)).WithField("modifiedLen", len(modified)).Info("grpc interceptor: native JSON replace done")
+		return modified, nil
+	}
+
+	log.Warn("grpc interceptor: dummy prompt not found, falling back to full replace")
+	return i.fullJSONReplace(body, pending)
+}
+
+// replaceDummyInContents walks the contents array from the end and replaces
+// the dummy prompt text or fills an empty <USER_REQUEST> block with the real
+// user input. The LS agent framework may leave <USER_REQUEST></USER_REQUEST>
+// empty when the cascade text isn't forwarded into the request body.
+func (i *Interceptor) replaceDummyInContents(target map[string]interface{}, dummy, replacement string) bool {
+	contents, ok := target["contents"].([]interface{})
+	if !ok {
+		return false
+	}
+
+	emptyUserRequest := "<USER_REQUEST>\n\n</USER_REQUEST>"
+	filledUserRequest := "<USER_REQUEST>\n" + replacement + "\n</USER_REQUEST>"
+
+	for ci := len(contents) - 1; ci >= 0; ci-- {
+		entry, ok := contents[ci].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parts, ok := entry["parts"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, part := range parts {
+			p, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			text, ok := p["text"].(string)
+			if !ok {
+				continue
+			}
+
+			// Strategy 1: exact dummy prompt match
+			if text == dummy || strings.Contains(text, dummy) {
+				p["text"] = strings.Replace(text, dummy, replacement, 1)
+				log.WithField("contentIdx", ci).Info("grpc interceptor: replaced dummy prompt in-place")
+				return true
+			}
+
+			// Strategy 2: fill empty <USER_REQUEST> block
+			if strings.Contains(text, emptyUserRequest) {
+				p["text"] = strings.Replace(text, emptyUserRequest, filledUserRequest, 1)
+				log.WithField("contentIdx", ci).Info("grpc interceptor: filled empty USER_REQUEST block")
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// fullJSONReplace replaces the entire contents array (stealth/minimal modes).
+func (i *Interceptor) fullJSONReplace(body []byte, pending *PendingRequest) ([]byte, error) {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, nil
 	}
 
 	var contents []map[string]interface{}
 	for _, msg := range pending.Messages {
+		text := msg.Content
+		if len(i.cfg.SensitiveWords) > 0 {
+			text = obfuscateSensitiveWords(text, i.cfg.SensitiveWords)
+		}
 		contents = append(contents, map[string]interface{}{
 			"role": msg.Role,
 			"parts": []map[string]interface{}{
-				{"text": msg.Content},
+				{"text": text},
 			},
 		})
 	}
-	req["contents"] = contents
 
-	if pending.SystemPrompt != "" {
-		if i.cfg.SystemMode == "stealth" || i.cfg.SystemMode == "minimal" {
+	inner, hasInner := req["request"].(map[string]interface{})
+	if hasInner {
+		inner["contents"] = contents
+		delete(inner, "tools")
+		delete(inner, "toolConfig")
+		if pending.SystemPrompt != "" {
+			inner["systemInstruction"] = map[string]interface{}{
+				"parts": []map[string]interface{}{
+					{"text": pending.SystemPrompt},
+				},
+			}
+		}
+	} else {
+		req["contents"] = contents
+		delete(req, "tools")
+		delete(req, "toolConfig")
+		if pending.Model != "" {
+			req["model"] = pending.Model
+		}
+		if pending.SystemPrompt != "" {
 			req["systemInstruction"] = map[string]interface{}{
 				"parts": []map[string]interface{}{
 					{"text": pending.SystemPrompt},
@@ -363,7 +632,78 @@ func (i *Interceptor) modifyJSONBody(body []byte, pending *PendingRequest) ([]by
 	if err != nil {
 		return body, err
 	}
+	log.WithField("originalLen", len(body)).WithField("modifiedLen", len(modified)).Info("grpc interceptor: full JSON replace done")
 	return modified, nil
+}
+
+// mergeToolDeclarations consolidates multiple tool entries (each containing
+// functionDeclarations) into a single tool entry with all declarations merged.
+// The LS sends each function as a separate {"functionDeclarations": [fn]} entry.
+// Google's API rejects multiple tool entries unless they're all search tools.
+func mergeToolDeclarations(root map[string]interface{}) {
+	tools, ok := root["tools"].([]interface{})
+	if !ok || len(tools) <= 1 {
+		return
+	}
+
+	var allDecls []interface{}
+	for _, tool := range tools {
+		t, ok := tool.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if decls, ok := t["functionDeclarations"].([]interface{}); ok {
+			allDecls = append(allDecls, decls...)
+		}
+		if decls, ok := t["function_declarations"].([]interface{}); ok {
+			allDecls = append(allDecls, decls...)
+		}
+	}
+
+	if len(allDecls) > 0 {
+		root["tools"] = []interface{}{
+			map[string]interface{}{
+				"functionDeclarations": allDecls,
+			},
+		}
+		log.WithField("functions", len(allDecls)).WithField("originalEntries", len(tools)).Info("grpc interceptor: merged tool declarations into single entry")
+	}
+}
+
+// enforceMaxOutputTokens ensures generationConfig.maxOutputTokens has a
+// minimum of 4096 and defaults to 64000 if missing. This matches ZG's
+// policy of ensuring adequate response length.
+func enforceMaxOutputTokens(target map[string]interface{}) {
+	const defaultMax = 64000
+	const minMax = 4096
+
+	gc, ok := target["generationConfig"].(map[string]interface{})
+	if !ok {
+		target["generationConfig"] = map[string]interface{}{
+			"maxOutputTokens": float64(defaultMax),
+		}
+		return
+	}
+
+	current, ok := gc["maxOutputTokens"].(float64)
+	if !ok || current == 0 {
+		gc["maxOutputTokens"] = float64(defaultMax)
+	} else if current < minMax {
+		gc["maxOutputTokens"] = float64(minMax)
+	}
+}
+
+// obfuscateSensitiveWords inserts zero-width spaces into sensitive client
+// names to reduce detectability in server-side logs.
+func obfuscateSensitiveWords(text string, words []string) string {
+	for _, word := range words {
+		if len(word) < 2 {
+			continue
+		}
+		obfuscated := string(word[0]) + "\u200b" + word[1:]
+		text = strings.ReplaceAll(text, word, obfuscated)
+	}
+	return text
 }
 
 func (i *Interceptor) extractGRPCResponse(body []byte, active *PendingRequest) ([]byte, error) {
@@ -392,6 +732,11 @@ func (i *Interceptor) extractJSONResponse(body []byte, active *PendingRequest) (
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body, nil
+	}
+
+	// Cloud Code API wraps response in {"response": {...}}
+	if inner, ok := resp["response"].(map[string]interface{}); ok {
+		resp = inner
 	}
 
 	text := ""
@@ -462,7 +807,7 @@ func extractFromProtoResponse(data []byte) (text string, finishReason string) {
 	}
 
 	// Extract finish reason.
-	if frField := FindField(candidateFields, FieldCandidateFinishReson); frField != nil {
+	if frField := FindField(candidateFields, FieldCandidateFinishReason); frField != nil {
 		v, err := GetVarintValue(*frField)
 		if err == nil {
 			switch v {
@@ -531,6 +876,10 @@ func extractTextFromChunk(chunk []byte) (string, string, error) {
 	if len(chunk) > 0 && (chunk[0] == '{' || chunk[0] == '[') {
 		var resp map[string]interface{}
 		if err := json.Unmarshal(chunk, &resp); err == nil {
+			// Cloud Code API wraps response in {"response": {...}}
+			if inner, ok := resp["response"].(map[string]interface{}); ok {
+				resp = inner
+			}
 			text := ""
 			finishReason := ""
 			if candidates, ok := resp["candidates"].([]interface{}); ok && len(candidates) > 0 {
@@ -549,6 +898,9 @@ func extractTextFromChunk(chunk []byte) (string, string, error) {
 					}
 				}
 			}
+			if text != "" && finishReason == "" {
+				finishReason = "STOP"
+			}
 			return text, finishReason, nil
 		}
 	}
@@ -565,6 +917,13 @@ func extractTextFromChunk(chunk []byte) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("unrecognized chunk format")
+}
+
+func truncateBytes(b []byte, max int) string {
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "..."
 }
 
 func isGRPCRequest(req *http.Request) bool {

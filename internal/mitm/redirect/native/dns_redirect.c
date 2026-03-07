@@ -9,6 +9,10 @@
  * Environment variables:
  *   MITM_PROXY_PORT  - Local port where the MITM proxy is listening
  *   MITM_TARGET_HOST - Hostname to intercept (default: cloudcode-pa.googleapis.com)
+ *
+ * The connect() hook only redirects connections whose destination IP was
+ * previously resolved by our hooked getaddrinfo() for the target hostname.
+ * This avoids breaking non-target HTTPS connections.
  */
 
 #ifdef _WIN32
@@ -30,19 +34,41 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <pthread.h>
 #endif
 
-/* The default target hostname to intercept. */
 static const char *DEFAULT_TARGET_HOST = "cloudcode-pa.googleapis.com";
 
-/* Cached values from environment. */
 static int g_proxy_port = 0;
 static const char *g_target_host = NULL;
 static int g_initialized = 0;
 
+/*
+ * Track up to 16 resolved IP addresses for the target host.
+ * connect() only redirects if the destination IP is in this table.
+ */
+#define MAX_TRACKED_IPS 16
+static uint32_t g_target_ips[MAX_TRACKED_IPS];
+static int g_target_ip_count = 0;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_ip_lock;
+static volatile LONG g_ip_lock_init = 0;
+#define IP_LOCK_INIT() do { if (InterlockedCompareExchange(&g_ip_lock_init, 1, 0) == 0) InitializeCriticalSection(&g_ip_lock); } while(0)
+#define IP_LOCK()   EnterCriticalSection(&g_ip_lock)
+#define IP_UNLOCK() LeaveCriticalSection(&g_ip_lock)
+#else
+static pthread_mutex_t g_ip_lock = PTHREAD_MUTEX_INITIALIZER;
+#define IP_LOCK_INIT() ((void)0)
+#define IP_LOCK()   pthread_mutex_lock(&g_ip_lock)
+#define IP_UNLOCK() pthread_mutex_unlock(&g_ip_lock)
+#endif
+
 static void ensure_init(void) {
     if (g_initialized) return;
     g_initialized = 1;
+
+    IP_LOCK_INIT();
 
     const char *port_str = getenv("MITM_PROXY_PORT");
     if (port_str) {
@@ -59,6 +85,25 @@ static int host_matches(const char *hostname) {
     if (!hostname) return 0;
     ensure_init();
     return strcmp(hostname, g_target_host) == 0;
+}
+
+static void track_ip(uint32_t ip) {
+    IP_LOCK();
+    if (g_target_ip_count >= MAX_TRACKED_IPS) { IP_UNLOCK(); return; }
+    for (int i = 0; i < g_target_ip_count; i++) {
+        if (g_target_ips[i] == ip) { IP_UNLOCK(); return; }
+    }
+    g_target_ips[g_target_ip_count++] = ip;
+    IP_UNLOCK();
+}
+
+static int is_tracked_ip(uint32_t ip) {
+    IP_LOCK();
+    for (int i = 0; i < g_target_ip_count; i++) {
+        if (g_target_ips[i] == ip) { IP_UNLOCK(); return 1; }
+    }
+    IP_UNLOCK();
+    return 0;
 }
 
 #ifndef _WIN32
@@ -84,8 +129,8 @@ static void load_real_functions(void) {
 
 /*
  * Hooked getaddrinfo:
- * If the requested hostname matches the target, return 127.0.0.1
- * so the LS connects to our local MITM proxy instead of Google.
+ * If the requested hostname matches the target, return 127.0.0.1:{proxy_port}
+ * AND record the real resolved IPs for the connect() hook.
  */
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints,
@@ -94,7 +139,20 @@ int getaddrinfo(const char *node, const char *service,
     ensure_init();
 
     if (node && host_matches(node) && g_proxy_port > 0) {
-        /* Allocate a result pointing to 127.0.0.1 with the proxy port. */
+        /* First, resolve the real IPs so we can track them for connect(). */
+        struct addrinfo *real_res = NULL;
+        if (real_getaddrinfo(node, service, hints, &real_res) == 0) {
+            struct addrinfo *rp;
+            for (rp = real_res; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET) {
+                    struct sockaddr_in *sa = (struct sockaddr_in *)rp->ai_addr;
+                    track_ip(sa->sin_addr.s_addr);
+                }
+            }
+            freeaddrinfo(real_res);
+        }
+
+        /* Return 127.0.0.1 with the proxy port. */
         struct addrinfo *ai = (struct addrinfo *)calloc(1, sizeof(struct addrinfo));
         struct sockaddr_in *sa = (struct sockaddr_in *)calloc(1, sizeof(struct sockaddr_in));
 
@@ -119,9 +177,8 @@ int getaddrinfo(const char *node, const char *service,
 
 /*
  * Hooked connect:
- * Intercepts connections to port 443 that target Google's known IP ranges
- * and redirects them to the local MITM proxy. This is a fallback for cases
- * where the binary doesn't use getaddrinfo (e.g., hardcoded IPs or custom DNS).
+ * Only intercepts connections to IPs that were resolved for the target host
+ * on port 443. This prevents breaking other HTTPS connections.
  */
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     load_real_functions();
@@ -131,8 +188,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         struct sockaddr_in *sa = (struct sockaddr_in *)addr;
         int port = ntohs(sa->sin_port);
 
-        /* Only intercept HTTPS (port 443) connections. */
-        if (port == 443) {
+        if (port == 443 && is_tracked_ip(sa->sin_addr.s_addr)) {
             struct sockaddr_in local;
             memset(&local, 0, sizeof(local));
             local.sin_family = AF_INET;
@@ -148,14 +204,6 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 #else
 /* ======================== Windows ======================== */
-
-/*
- * On Windows we use Detours-style IAT patching.
- * The DLL is injected into the Language Server process via CreateRemoteThread.
- *
- * For simplicity, this implementation hooks the Winsock getaddrinfo and
- * WSAConnect functions by patching the IAT of the target process.
- */
 
 typedef int (WSAAPI *real_getaddrinfo_t)(PCSTR, PCSTR,
                                          const ADDRINFOA *,
@@ -183,6 +231,19 @@ int WSAAPI hooked_getaddrinfo(PCSTR node, PCSTR service,
     ensure_init();
 
     if (node && host_matches(node) && g_proxy_port > 0) {
+        /* Resolve real IPs for tracking. */
+        PADDRINFOA real_res = NULL;
+        if (real_win_getaddrinfo(node, service, hints, &real_res) == 0) {
+            PADDRINFOA rp;
+            for (rp = real_res; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET) {
+                    struct sockaddr_in *sa = (struct sockaddr_in *)rp->ai_addr;
+                    track_ip(sa->sin_addr.s_addr);
+                }
+            }
+            freeaddrinfo(real_res);
+        }
+
         PADDRINFOA ai = (PADDRINFOA)calloc(1, sizeof(ADDRINFOA));
         struct sockaddr_in *sa = (struct sockaddr_in *)calloc(1, sizeof(struct sockaddr_in));
 
@@ -209,7 +270,7 @@ int WSAAPI hooked_connect(SOCKET s, const struct sockaddr *name, int namelen) {
 
     if (g_proxy_port > 0 && name && name->sa_family == AF_INET) {
         struct sockaddr_in *sa = (struct sockaddr_in *)name;
-        if (ntohs(sa->sin_port) == 443) {
+        if (ntohs(sa->sin_port) == 443 && is_tracked_ip(sa->sin_addr.s_addr)) {
             struct sockaddr_in local;
             memset(&local, 0, sizeof(local));
             local.sin_family = AF_INET;

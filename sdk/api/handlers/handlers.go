@@ -757,11 +757,7 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
 	providers = util.GetProviderName(baseModel)
-	// Fallback: if baseModel has no provider but differs from resolvedModelName,
-	// try using the full model name. This handles edge cases where custom models
-	// may be registered with their full suffixed name (e.g., "my-model(8192)").
-	// Evaluated in Story 11.8: This fallback is intentionally preserved to support
-	// custom model registrations that include thinking suffixes.
+	fmt.Printf("[DEBUG getRequestDetails] modelName=%q resolvedModelName=%q baseModel=%q providers=%v\n", modelName, resolvedModelName, baseModel, providers)
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
 	}
