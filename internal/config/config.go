@@ -115,10 +115,23 @@ type Config struct {
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
+	// ExtraModels defines per-provider additional model IDs appended to the dynamically
+	// fetched (or static fallback) model lists. Useful for models that exist upstream
+	// but are not returned by the listing API (e.g. gpt-5.4).
+	ExtraModels map[string][]ExtraModel `yaml:"extra-models,omitempty" json:"extra-models,omitempty"`
+
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// ExtraModel represents a user-defined model to be appended to a provider's model list.
+type ExtraModel struct {
+	// ID is the model identifier used for routing and listing.
+	ID string `yaml:"id" json:"id"`
+	// DisplayName is an optional human-readable name shown in /v1/models.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests

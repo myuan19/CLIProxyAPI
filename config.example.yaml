@@ -307,6 +307,23 @@ nonstream-keepalive-interval: 0
 #   kimi:
 #     - "kimi-k2-thinking"
 
+# Extra models per provider
+# Append custom model IDs to the dynamically fetched model list.
+# Useful when a model exists upstream but is not returned by the listing API.
+# Supported provider keys: codex, gemini, claude, and any openai-compatibility name (lowercase).
+# extra-models:
+#   codex:
+#     - id: "gpt-5.4"
+#       display-name: "GPT 5.4"
+#     - id: "o3-pro"
+#       display-name: "O3 Pro"
+#   gemini:
+#     - id: "gemini-custom-model"
+#   claude:
+#     - id: "claude-special-model"
+#   siliconflow:              # matches openai-compatibility name (case-insensitive)
+#     - id: "custom-model-id"
+
 # Optional payload configuration
 # payload:
 #   default: # Default rules only set parameters when they are missing in the payload.

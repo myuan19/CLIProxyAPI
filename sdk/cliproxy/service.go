@@ -775,7 +775,16 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	var models []*ModelInfo
 	switch provider {
 	case "gemini":
-		models = registry.GetGeminiModels()
+		if authKind == "apikey" {
+			apiKey, baseURL := extractGeminiKeyAndBase(a)
+			if dyn := registry.GlobalModelFetcher().FetchGeminiModels(apiKey, baseURL); len(dyn) > 0 {
+				models = dyn
+			} else {
+				models = registry.GetGeminiModels()
+			}
+		} else {
+			models = registry.GetGeminiModels()
+		}
 		if entry := s.resolveConfigGeminiKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildGeminiConfigModels(entry)
@@ -784,6 +793,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = mergeExtraModels(models, s.cfg, "gemini", "google", "gemini")
 		models = applyExcludedModels(models, excluded)
 	case "vertex":
 		// Vertex AI Gemini supports the same model identifiers as Gemini.
@@ -806,7 +816,16 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		cancel()
 		models = applyExcludedModels(models, excluded)
 	case "claude":
-		models = registry.GetClaudeModels()
+		if authKind == "apikey" {
+			apiKey, baseURL := extractClaudeKeyAndBase(a)
+			if dyn := registry.GlobalModelFetcher().FetchClaudeModels(apiKey, baseURL); len(dyn) > 0 {
+				models = dyn
+			} else {
+				models = registry.GetClaudeModels()
+			}
+		} else {
+			models = registry.GetClaudeModels()
+		}
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildClaudeConfigModels(entry)
@@ -815,9 +834,18 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = mergeExtraModels(models, s.cfg, "claude", "anthropic", "claude")
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		models = registry.GetOpenAIModels()
+		if token := extractCodexToken(a); token != "" {
+			if dyn := registry.GlobalModelFetcher().FetchCodexModels(token); len(dyn) > 0 {
+				models = dyn
+			} else {
+				models = registry.GetOpenAIModels()
+			}
+		} else {
+			models = registry.GetOpenAIModels()
+		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
@@ -826,6 +854,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = mergeExtraModels(models, s.cfg, "codex", "openai", "openai")
 		models = applyExcludedModels(models, excluded)
 	case "qwen":
 		models = registry.GetQwenModels()
@@ -879,33 +908,41 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				compat := &s.cfg.OpenAICompatibility[i]
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
-					// Convert compatibility models to registry models
-					ms := make([]*ModelInfo, 0, len(compat.Models))
-					for j := range compat.Models {
-						m := compat.Models[j]
-						// Use alias as model ID, fallback to name if alias is empty
-						modelID := m.Alias
-						if modelID == "" {
-							modelID = m.Name
+					var ms []*ModelInfo
+					if len(compat.Models) > 0 {
+						ms = make([]*ModelInfo, 0, len(compat.Models))
+						for j := range compat.Models {
+							m := compat.Models[j]
+							modelID := m.Alias
+							if modelID == "" {
+								modelID = m.Name
+							}
+							ms = append(ms, &ModelInfo{
+								ID:          modelID,
+								Object:      "model",
+								Created:     time.Now().Unix(),
+								OwnedBy:     compat.Name,
+								Type:        "openai-compatibility",
+								DisplayName: modelID,
+								UserDefined: true,
+							})
 						}
-						ms = append(ms, &ModelInfo{
-							ID:          modelID,
-							Object:      "model",
-							Created:     time.Now().Unix(),
-							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
-							DisplayName: modelID,
-							UserDefined: true,
-						})
+					} else if compat.BaseURL != "" {
+						apiKey := ""
+						if len(compat.APIKeyEntries) > 0 {
+							apiKey = compat.APIKeyEntries[0].APIKey
+						}
+						if apiKey != "" {
+							ms = registry.GlobalModelFetcher().FetchOpenAICompatModels(apiKey, compat.BaseURL, compat.Name)
+						}
 					}
-					// Register and return
+					ms = mergeExtraModels(ms, s.cfg, strings.ToLower(compat.Name), compat.Name, "openai-compatibility")
 					if len(ms) > 0 {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
 						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
-						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
 					}
 					return
@@ -1030,6 +1067,45 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 	return nil
 }
 
+func extractCodexToken(a *coreauth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	if a.Attributes != nil {
+		if v := a.Attributes["api_key"]; v != "" {
+			return v
+		}
+	}
+	if a.Metadata != nil {
+		if v, ok := a.Metadata["access_token"].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func extractGeminiKeyAndBase(a *coreauth.Auth) (apiKey, baseURL string) {
+	if a == nil {
+		return
+	}
+	if a.Attributes != nil {
+		apiKey = a.Attributes["api_key"]
+		baseURL = a.Attributes["base_url"]
+	}
+	return
+}
+
+func extractClaudeKeyAndBase(a *coreauth.Auth) (apiKey, baseURL string) {
+	if a == nil {
+		return
+	}
+	if a.Attributes != nil {
+		apiKey = a.Attributes["api_key"]
+		baseURL = a.Attributes["base_url"]
+	}
+	return
+}
+
 func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	if auth == nil || s.cfg == nil {
 		return nil
@@ -1067,6 +1143,45 @@ func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 		return nil
 	}
 	return cfg.OAuthExcludedModels[providerKey]
+}
+
+// mergeExtraModels appends user-defined extra models from config into the model list,
+// de-duplicating by model ID.
+func mergeExtraModels(models []*ModelInfo, cfg *config.Config, providerKey, ownedBy, modelType string) []*ModelInfo {
+	if cfg == nil || len(cfg.ExtraModels) == 0 {
+		return models
+	}
+	extras, ok := cfg.ExtraModels[providerKey]
+	if !ok || len(extras) == 0 {
+		return models
+	}
+	existing := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		existing[strings.ToLower(m.ID)] = struct{}{}
+	}
+	for _, e := range extras {
+		id := strings.TrimSpace(e.ID)
+		if id == "" {
+			continue
+		}
+		if _, dup := existing[strings.ToLower(id)]; dup {
+			continue
+		}
+		displayName := e.DisplayName
+		if displayName == "" {
+			displayName = id
+		}
+		models = append(models, &ModelInfo{
+			ID:          id,
+			Object:      "model",
+			Created:     time.Now().Unix(),
+			OwnedBy:     ownedBy,
+			Type:        modelType,
+			DisplayName: displayName,
+		})
+		existing[strings.ToLower(id)] = struct{}{}
+	}
+	return models
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {

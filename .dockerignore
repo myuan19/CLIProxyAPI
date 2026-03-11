@@ -20,6 +20,14 @@ auths/*
 logs/*
 conv/*
 config.yaml
+config.test.yaml
+config.*.yaml
+!config.example.yaml
+pgstore/*
+gitstore/*
+objectstore/*
+temp/*
+refs/*
 
 # Development/editor
 bin/*
@@ -34,3 +42,14 @@ bin/*
 .bmad/*
 _bmad/*
 _bmad-output/*
+
+# Environment and dev artifacts (prevent leaking secrets into build context)
+.env
+.env.*
+!.env.example
+.DEV/logs
+.DEV/config.test.yaml
+.DEV/docs
+.DEV/experiments
+.DEV/static/*
+!.DEV/static/management.html

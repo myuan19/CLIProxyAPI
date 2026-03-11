@@ -280,3 +280,154 @@ func TestUserFieldDeletion(t *testing.T) {
 		t.Errorf("user field should be deleted, but it was found with value: %s", userField.Raw)
 	}
 }
+
+// TestStripInvalidFunctionCalls_EmptyName tests removal of function_call items with empty name
+// and their corresponding function_call_output items.
+func TestStripInvalidFunctionCalls_EmptyName(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"thinking"}]},
+			{"type":"function_call","call_id":"call_abc","name":"DocSearch","arguments":"{\"q\":\"test\"}"},
+			{"type":"function_call","call_id":"fc_04f15afa","name":"","arguments":"{\"q\":\"test\"}"},
+			{"type":"function_call_output","call_id":"call_abc","output":"results here"},
+			{"type":"function_call_output","call_id":"fc_04f15afa","output":"未知工具: "}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5", inputJSON, false)
+	outputStr := string(output)
+
+	inputArr := gjson.Get(outputStr, "input")
+	if !inputArr.IsArray() {
+		t.Fatal("input should be an array")
+	}
+	items := inputArr.Array()
+
+	// Should have 4 items: user msg, assistant msg, valid function_call, valid function_call_output
+	if len(items) != 4 {
+		t.Fatalf("Expected 4 items after cleanup, got %d: %s", len(items), inputArr.Raw)
+	}
+
+	// The function_call with empty name and its output should be gone
+	for i, item := range items {
+		if item.Get("call_id").String() == "fc_04f15afa" {
+			t.Errorf("item %d still references removed call_id fc_04f15afa: %s", i, item.Raw)
+		}
+	}
+
+	// The valid function_call should remain
+	if items[2].Get("type").String() != "function_call" || items[2].Get("name").String() != "DocSearch" {
+		t.Errorf("Expected valid function_call at index 2, got: %s", items[2].Raw)
+	}
+	if items[3].Get("type").String() != "function_call_output" || items[3].Get("call_id").String() != "call_abc" {
+		t.Errorf("Expected valid function_call_output at index 3, got: %s", items[3].Raw)
+	}
+}
+
+// TestStripInvalidFunctionCalls_DuplicateCallID tests deduplication of function_call items
+// sharing the same call_id (keeps first occurrence).
+func TestStripInvalidFunctionCalls_DuplicateCallID(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"function_call","id":"fc_aaa","call_id":"call_123","name":"Search","arguments":"{}"},
+			{"type":"function_call","call_id":"call_123","name":"Search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_123","output":"ok"}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5", inputJSON, false)
+	outputStr := string(output)
+
+	items := gjson.Get(outputStr, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("Expected 3 items after dedup, got %d: %s", len(items), gjson.Get(outputStr, "input").Raw)
+	}
+
+	// Only one function_call should remain (the first one, with id field)
+	fc := items[1]
+	if fc.Get("type").String() != "function_call" {
+		t.Errorf("Expected function_call at index 1, got: %s", fc.Raw)
+	}
+	if fc.Get("id").String() != "fc_aaa" {
+		t.Errorf("Expected first occurrence (with id fc_aaa) to be kept, got: %s", fc.Raw)
+	}
+}
+
+// TestStripInvalidFunctionCalls_NoChanges tests that clean input passes through unchanged.
+func TestStripInvalidFunctionCalls_NoChanges(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"function_call","call_id":"call_1","name":"Func1","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"done"}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5", inputJSON, false)
+	items := gjson.GetBytes(output, "input").Array()
+
+	if len(items) != 3 {
+		t.Fatalf("Expected 3 items (no removal), got %d", len(items))
+	}
+}
+
+// TestStripInvalidFunctionCalls_RealWorldDuplicate reproduces the exact pattern reported:
+// interleaved call_ and fc_ items with empty names.
+func TestStripInvalidFunctionCalls_RealWorldDuplicate(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4",
+		"stream": true,
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"灵狐是啥"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"让我搜索一下"}]},
+			{"type":"function_call","call_id":"call_IvYn","name":"DocSearch","arguments":"{\"query\":\"灵狐\"}"},
+			{"type":"function_call","call_id":"fc_04f15afa","name":"","arguments":"{\"query\":\"灵狐\"}"},
+			{"type":"function_call","call_id":"call_2C0r","name":"DocGrep","arguments":"{\"pattern\":\"灵狐\"}"},
+			{"type":"function_call","call_id":"fc_04f15afb","name":"","arguments":"{\"pattern\":\"灵狐\"}"},
+			{"type":"function_call","call_id":"call_VMUw","name":"DocGlob","arguments":"{\"pattern\":\"*灵狐*\"}"},
+			{"type":"function_call","call_id":"fc_04f15afc","name":"","arguments":"{\"pattern\":\"*灵狐*\"}"},
+			{"type":"function_call_output","call_id":"call_IvYn","output":"搜索结果..."},
+			{"type":"function_call_output","call_id":"fc_04f15afa","output":"未知工具: "},
+			{"type":"function_call_output","call_id":"call_2C0r","output":"匹配结果..."},
+			{"type":"function_call_output","call_id":"fc_04f15afb","output":"未知工具: "},
+			{"type":"function_call_output","call_id":"call_VMUw","output":"文件列表..."},
+			{"type":"function_call_output","call_id":"fc_04f15afc","output":"未知工具: "}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+	outputStr := string(output)
+
+	items := gjson.Get(outputStr, "input").Array()
+
+	// Should keep: 2 messages + 3 valid function_calls + 3 valid function_call_outputs = 8
+	if len(items) != 8 {
+		t.Fatalf("Expected 8 items after cleanup, got %d: %s", len(items), gjson.Get(outputStr, "input").Raw)
+	}
+
+	// Verify no fc_ call_ids remain
+	for i, item := range items {
+		cid := item.Get("call_id").String()
+		if len(cid) > 0 && cid[:3] == "fc_" {
+			t.Errorf("item %d still has fc_ call_id %q", i, cid)
+		}
+	}
+
+	// Verify all three valid function_calls remain with correct names
+	names := map[string]bool{}
+	for _, item := range items {
+		if item.Get("type").String() == "function_call" {
+			names[item.Get("name").String()] = true
+		}
+	}
+	for _, expected := range []string{"DocSearch", "DocGrep", "DocGlob"} {
+		if !names[expected] {
+			t.Errorf("Expected function_call with name %q to survive cleanup", expected)
+		}
+	}
+}
