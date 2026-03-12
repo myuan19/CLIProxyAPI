@@ -389,3 +389,29 @@ func writeSSProxyTargetAddr(conn net.Conn, addr string) error {
 	}
 	return nil
 }
+
+// CheckProxyConnectivity tests whether the given proxy URL (and optional proxy DNS) can successfully
+// make an outbound HTTP request. Used for proxy server connectivity checks in the management API.
+func CheckProxyConnectivity(ctx context.Context, proxyURL, proxyDNS string) error {
+	transport := buildProxyTransport(proxyURL, proxyDNS)
+	if transport == nil {
+		return fmt.Errorf("failed to build proxy transport from URL")
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com/generate_204", nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("proxy request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	return nil
+}

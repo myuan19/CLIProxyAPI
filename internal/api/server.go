@@ -675,6 +675,15 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/providers", s.mgmt.ListProviders)
 		mgmt.GET("/providers/health", s.mgmt.CheckProvidersHealth)
 
+		mgmt.GET("/proxy-servers", s.mgmt.ListProxyServers)
+		mgmt.GET("/proxy-servers/check-all", s.mgmt.CheckAllProxyServersStream)
+		mgmt.GET("/proxy-servers/:id", s.mgmt.GetProxyServer)
+		mgmt.POST("/proxy-servers", s.mgmt.CreateProxyServer)
+		mgmt.PUT("/proxy-servers/:id", s.mgmt.UpdateProxyServer)
+		mgmt.DELETE("/proxy-servers/:id", s.mgmt.DeleteProxyServer)
+		mgmt.POST("/proxy-servers/:id/check", s.mgmt.CheckProxyServerConnectivity)
+		mgmt.POST("/proxy-servers/:id/apply/auth-file", s.mgmt.ApplyProxyToAuthFile)
+
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

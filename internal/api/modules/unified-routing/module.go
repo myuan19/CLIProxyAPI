@@ -26,13 +26,13 @@ type Module struct {
 	stateStore   StateStore
 	metricsStore MetricsStore
 
-		configSvc        ConfigService
-		stateMgr         StateManager
-		metrics          MetricsCollector
-		routeActivity    *RouteActivityTracker
-		healthChecker    HealthChecker
-		engine           RoutingEngine
-		handlers         *Handlers
+	configSvc     ConfigService
+	stateMgr      StateManager
+	metrics       MetricsCollector
+	routeActivity *RouteActivityTracker
+	healthChecker HealthChecker
+	engine        RoutingEngine
+	handlers      *Handlers
 
 	initOnce       sync.Once
 	routesOnce     sync.Once
@@ -279,6 +279,7 @@ func (m *Module) doRegisterRoutes(engine *gin.Engine, auth gin.HandlerFunc) {
 	// Credentials
 	ur.GET("/credentials", m.handlers.ListCredentials)
 	ur.GET("/credentials/:credential_id", m.handlers.GetCredential)
+	ur.PATCH("/credentials/:credential_id/status", m.handlers.PatchCredentialStatus)
 }
 
 // OnConfigUpdated handles configuration updates.

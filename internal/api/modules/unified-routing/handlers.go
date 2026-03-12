@@ -948,6 +948,54 @@ func (h *Handlers) GetCredential(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
 }
 
+// PatchCredentialStatus updates the disabled state of a credential.
+// PATCH /credentials/:credential_id/status
+// Body: { "disabled": true|false }
+func (h *Handlers) PatchCredentialStatus(c *gin.Context) {
+	credentialID := strings.TrimSpace(c.Param("credential_id"))
+	if credentialID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "credential_id is required"})
+		return
+	}
+
+	var req struct {
+		Disabled *bool `json:"disabled" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: disabled is required"})
+		return
+	}
+
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager unavailable"})
+		return
+	}
+
+	auth, ok := h.authManager.GetByID(credentialID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
+		return
+	}
+
+	auth.Disabled = *req.Disabled
+	if *req.Disabled {
+		auth.Status = coreauth.StatusDisabled
+		auth.StatusMessage = "disabled via management API"
+	} else {
+		auth.Status = coreauth.StatusActive
+		auth.StatusMessage = ""
+	}
+	auth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(c.Request.Context(), auth); err != nil {
+		log.Errorf("[UnifiedRouting] PatchCredentialStatus Update failed for %q: %v", credentialID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
 // ================== Simulate Route ==================
 
 // SimulateRouteRequest represents a request to simulate routing.

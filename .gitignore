@@ -6,6 +6,7 @@ cli-proxy-api
 config.yaml
 config.test.yaml
 .env
+*.local
 
 # Generated content
 bin/*
@@ -47,6 +48,10 @@ GEMINI.md
 .bmad/*
 _bmad/*
 _bmad-output/*
+
+# Agent experiments (may contain credentials, tokens, sensitive data)
+_AGENT/
+**/credentials.json
 
 # macOS
 .DS_Store
