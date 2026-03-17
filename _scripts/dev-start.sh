@@ -4,9 +4,9 @@
 
 set -e  # 遇到错误立即退出
 
-# 获取脚本所在目录，从 .dev/scripts/ 往上两层到项目根目录，再往上一层到工作区根目录
+# 获取脚本所在目录，从 _scripts/ 往上一层到项目根目录，再往上一层到工作区根目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$BACKEND_DIR/.." && pwd)"
 FRONTEND_DIR="$WORKSPACE_ROOT/Cli-Proxy-API-Management-Center"
 BACKEND_STATIC_DIR="$BACKEND_DIR/static"

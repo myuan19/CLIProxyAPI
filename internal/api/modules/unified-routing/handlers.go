@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -29,6 +30,7 @@ type Handlers struct {
 	engine         RoutingEngine
 	routeActivity  *RouteActivityTracker
 	detailedLogger *logging.DetailedRequestLogger
+	hookExecutor   *HookExecutor
 }
 
 // NewHandlers creates a new handlers instance.
@@ -1277,4 +1279,219 @@ func (h *Handlers) logSimulateRecord(route *Route, resp *SimulateRouteResponse, 
 	}
 
 	h.detailedLogger.LogRecord(record)
+}
+
+// ================== Hooks ==================
+
+// ListHooks returns hooks, optionally filtered by route_id query param.
+func (h *Handlers) ListHooks(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	routeID := c.Query("route_id")
+	hooks, err := h.hookExecutor.ListHooks(routeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"hooks": hooks, "total": len(hooks)})
+}
+
+// GetHook returns a single hook.
+func (h *Handlers) GetHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	hookID := c.Param("hook_id")
+	hook, err := h.hookExecutor.GetHook(hookID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, hook)
+}
+
+// CreateHook creates a new hook.
+func (h *Handlers) CreateHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	var hook HookConfig
+	if err := c.ShouldBindJSON(&hook); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if hook.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if hook.HookDir == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "hook_dir is required"})
+		return
+	}
+	if hook.RouteID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "route_id is required"})
+		return
+	}
+	if err := h.hookExecutor.CreateHook(&hook); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, hook)
+}
+
+// UpdateHook updates an existing hook.
+func (h *Handlers) UpdateHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	hookID := c.Param("hook_id")
+	var hook HookConfig
+	if err := c.ShouldBindJSON(&hook); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	hook.ID = hookID
+	if err := h.hookExecutor.UpdateHook(&hook); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, hook)
+}
+
+// DeleteHook deletes a hook.
+func (h *Handlers) DeleteHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	hookID := c.Param("hook_id")
+	if err := h.hookExecutor.DeleteHook(hookID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// TriggerHook manually triggers a hook with simulated event data.
+func (h *Handlers) TriggerHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	hookID := c.Param("hook_id")
+	var req ManualTriggerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	logEntry, err := h.hookExecutor.ManualTrigger(hookID, req)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, logEntry)
+}
+
+// StreamTriggerHook triggers a hook with SSE streaming of stdout/stderr.
+func (h *Handlers) StreamTriggerHook(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	hookID := c.Param("hook_id")
+	var req ManualTriggerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.WriteHeaderNow()
+
+	flusher, _ := c.Writer.(http.Flusher)
+
+	writeSSE := func(event string, data string) {
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, data)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	onLine := func(stream string, line string) {
+		escaped, _ := json.Marshal(map[string]string{"stream": stream, "line": line})
+		writeSSE("output", string(escaped))
+	}
+
+	logEntry, err := h.hookExecutor.ManualTriggerStream(hookID, req, onLine)
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
+		writeSSE("error", string(errJSON))
+		return
+	}
+
+	resultJSON, _ := json.Marshal(logEntry)
+	writeSSE("done", string(resultJSON))
+}
+
+// ListHookLogs returns hook execution logs.
+func (h *Handlers) ListHookLogs(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	routeID := c.Query("route_id")
+	hookID := c.Query("hook_id")
+	limit := 50
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	logs, err := h.hookExecutor.ListLogs(routeID, hookID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logs": logs, "total": len(logs)})
+}
+
+// ClearHookLogs clears all hook execution logs.
+func (h *Handlers) ClearHookLogs(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	if err := h.hookExecutor.ClearLogs(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "cleared"})
+}
+
+// ListAvailableHookDirs returns all available hook folders (each containing run.sh).
+func (h *Handlers) ListAvailableHookDirs(c *gin.Context) {
+	if h.hookExecutor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hooks not available"})
+		return
+	}
+	dirs, err := h.hookExecutor.ListAvailableDirs()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"dirs":        dirs,
+		"total":       len(dirs),
+		"scripts_dir": h.hookExecutor.ScriptsDir(),
+	})
 }

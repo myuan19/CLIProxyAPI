@@ -33,6 +33,7 @@ type Module struct {
 	healthChecker HealthChecker
 	engine        RoutingEngine
 	handlers      *Handlers
+	hookExecutor  *HookExecutor
 
 	initOnce       sync.Once
 	routesOnce     sync.Once
@@ -185,9 +186,23 @@ func (m *Module) init(ctx modules.Context) error {
 		m.healthChecker = NewHealthChecker(m.configSvc, m.stateMgr, m.metrics, m.authManager, m.routeActivity)
 		m.engine = NewRoutingEngine(m.configSvc, m.stateMgr, m.metrics, m.authManager, m.routeActivity, m.healthChecker)
 
+		// Initialize hook executor
+		hookScriptsDir := filepath.Join(dataDir, "hook-scripts")
+		hookExec, hookErr := NewHookExecutor(m.configStore.(*FileConfigStore), hookScriptsDir, logsDir)
+		if hookErr != nil {
+			log.Warnf("[UnifiedRouting] Hook executor init failed (hooks disabled): %v", hookErr)
+		} else {
+			m.hookExecutor = hookExec
+			if re, ok := m.engine.(*DefaultRoutingEngine); ok {
+				re.SetHookExecutor(hookExec)
+			}
+			log.Infof("[UnifiedRouting] Hook executor initialized (scripts dir: %s)", hookScriptsDir)
+		}
+
 		// Initialize handlers
 		m.handlers = NewHandlers(m.configSvc, m.stateMgr, m.metrics, m.healthChecker, m.authManager, m.engine, m.routeActivity)
 		m.handlers.detailedLogger = m.detailedLogger
+		m.handlers.hookExecutor = m.hookExecutor
 
 		log.Info("[UnifiedRouting] Module initialization complete")
 	})
@@ -280,6 +295,18 @@ func (m *Module) doRegisterRoutes(engine *gin.Engine, auth gin.HandlerFunc) {
 	ur.GET("/credentials", m.handlers.ListCredentials)
 	ur.GET("/credentials/:credential_id", m.handlers.GetCredential)
 	ur.PATCH("/credentials/:credential_id/status", m.handlers.PatchCredentialStatus)
+
+	// Hooks
+	ur.GET("/hooks", m.handlers.ListHooks)
+	ur.POST("/hooks", m.handlers.CreateHook)
+	ur.GET("/hooks/dirs", m.handlers.ListAvailableHookDirs)
+	ur.GET("/hooks/logs", m.handlers.ListHookLogs)
+	ur.DELETE("/hooks/logs", m.handlers.ClearHookLogs)
+	ur.GET("/hooks/:hook_id", m.handlers.GetHook)
+	ur.PUT("/hooks/:hook_id", m.handlers.UpdateHook)
+	ur.DELETE("/hooks/:hook_id", m.handlers.DeleteHook)
+	ur.POST("/hooks/:hook_id/trigger", m.handlers.TriggerHook)
+	ur.POST("/hooks/:hook_id/trigger-stream", m.handlers.StreamTriggerHook)
 }
 
 // OnConfigUpdated handles configuration updates.

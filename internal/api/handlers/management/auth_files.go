@@ -27,15 +27,14 @@ import (
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/healthcheck"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -599,71 +598,196 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-// Delete auth files: single by name or all
+// Delete auth files: single by name, multiple by names, or all.
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
 	ctx := c.Request.Context()
-	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
-		entries, err := os.ReadDir(h.cfg.AuthDir)
+	all, names, err := parseAuthDeleteRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if all {
+		names, err = h.listDeletableAuthFileNames()
 		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
 		}
-		deleted := 0
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if !strings.HasSuffix(strings.ToLower(name), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
+	}
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid name"})
+		return
+	}
+
+	deletedNames := make([]string, 0, len(names))
+	notFoundNames := make([]string, 0)
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		result, errDelete := h.deleteAuthFileByName(ctx, name)
+		switch {
+		case errDelete == nil:
+			deletedNames = append(deletedNames, result.Name)
+		case errors.Is(errDelete, os.ErrNotExist):
+			notFoundNames = append(notFoundNames, result.Name)
+		default:
+			failed = append(failed, gin.H{
+				"name":  result.Name,
+				"error": errDelete.Error(),
+			})
+		}
+	}
+
+	if len(names) == 1 {
+		if len(notFoundNames) == 1 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+			return
+		}
+		if len(failed) == 1 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": failed[0]["error"]})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
+
+	status := "ok"
+	if len(notFoundNames) > 0 || len(failed) > 0 {
+		status = "partial"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":        status,
+		"requested":     len(names),
+		"deleted":       len(deletedNames),
+		"deleted_names": deletedNames,
+		"not_found":     notFoundNames,
+		"failed":        failed,
+	})
+}
+
+type authDeleteResult struct {
+	Name string
+	Path string
+}
+
+func parseAuthDeleteRequest(c *gin.Context) (bool, []string, error) {
+	if all := strings.TrimSpace(c.Query("all")); all == "true" || all == "1" || all == "*" {
+		return true, nil, nil
+	}
+
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	addNames := func(values ...string) error {
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				name := strings.TrimSpace(part)
+				if name == "" {
+					continue
 				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
+				if strings.Contains(name, string(os.PathSeparator)) {
+					return fmt.Errorf("invalid name")
 				}
-				deleted++
-				h.disableAuth(ctx, full)
+				name = filepath.Base(name)
+				if _, ok := seen[name]; ok {
+					continue
+				}
+				seen[name] = struct{}{}
+				names = append(names, name)
 			}
 		}
-		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
-		return
+		return nil
 	}
-	name := c.Query("name")
+
+	if err := addNames(c.QueryArray("name")...); err != nil {
+		return false, nil, err
+	}
+	if err := addNames(c.QueryArray("names")...); err != nil {
+		return false, nil, err
+	}
+
+	if c.Request != nil && c.Request.Body != nil {
+		rawBody, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			return false, nil, fmt.Errorf("failed to read body")
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+		if len(bytes.TrimSpace(rawBody)) > 0 {
+			var req struct {
+				All   bool     `json:"all"`
+				Name  string   `json:"name"`
+				Names []string `json:"names"`
+			}
+			if err := json.Unmarshal(rawBody, &req); err != nil {
+				var rawNames []string
+				if errNames := json.Unmarshal(rawBody, &rawNames); errNames != nil {
+					return false, nil, fmt.Errorf("invalid request body")
+				}
+				if err := addNames(rawNames...); err != nil {
+					return false, nil, err
+				}
+			} else {
+				if req.All {
+					return true, nil, nil
+				}
+				if err := addNames(req.Name); err != nil {
+					return false, nil, err
+				}
+				if err := addNames(req.Names...); err != nil {
+					return false, nil, err
+				}
+			}
+		}
+	}
+
+	return false, names, nil
+}
+
+func (h *Handler) listDeletableAuthFileNames() ([]string, error) {
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (*authDeleteResult, error) {
+	name = filepath.Base(strings.TrimSpace(name))
+	result := &authDeleteResult{Name: name}
 	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
-		c.JSON(400, gin.H{"error": "invalid name"})
-		return
+		return result, fmt.Errorf("invalid name")
 	}
-	full := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	full := filepath.Join(h.cfg.AuthDir, name)
 	if !filepath.IsAbs(full) {
 		if abs, errAbs := filepath.Abs(full); errAbs == nil {
 			full = abs
 		}
 	}
+	result.Path = full
 	if err := os.Remove(full); err != nil {
 		if os.IsNotExist(err) {
-			c.JSON(404, gin.H{"error": "file not found"})
-		} else {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", err)})
+			return result, os.ErrNotExist
 		}
-		return
+		return result, fmt.Errorf("failed to remove file: %v", err)
 	}
 	if err := h.deleteTokenRecord(ctx, full); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+		return result, err
 	}
 	h.disableAuth(ctx, full)
-	c.JSON(200, gin.H{"status": "ok"})
+	return result, nil
 }
 
 func (h *Handler) authIDForPath(path string) string {
@@ -2547,12 +2671,12 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 
 	if len(models) == 0 {
 		c.JSON(http.StatusOK, gin.H{
-			"auth_id":        targetAuth.ID,
-			"status":         "healthy",
-			"healthy_count":  0,
+			"auth_id":         targetAuth.ID,
+			"status":          "healthy",
+			"healthy_count":   0,
 			"unhealthy_count": 0,
-			"total_count":    0,
-			"models":         []ModelHealth{},
+			"total_count":     0,
+			"models":          []ModelHealth{},
 		})
 		return
 	}
@@ -2574,19 +2698,7 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 		checkCtx, cancel := context.WithTimeout(usage.WithSkipUsage(context.Background()), time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
 
-		// Build minimal OpenAI-format request for health check (mimicking Cherry Studio)
-		// This will be translated by the executor to the appropriate provider format
-		openAIRequest := map[string]interface{}{
-			"model":    model.ID,
-			"messages": []map[string]interface{}{
-				{"role": "user", "content": "hi"},
-				{"role": "system", "content": "test"},
-			},
-			"stream":     true,
-			"max_tokens": 1,
-		}
-
-		requestJSON, err := json.Marshal(openAIRequest)
+		req, opts, err := healthcheck.BuildProbeRequest(targetAuth, model.ID)
 		if err != nil {
 			mu.Lock()
 			results = append(results, ModelHealth{
@@ -2597,19 +2709,6 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 			})
 			mu.Unlock()
 			return
-		}
-
-		// Build executor request
-		req := cliproxyexecutor.Request{
-			Model:   model.ID,
-			Payload: requestJSON,
-			Format:  sdktranslator.FormatOpenAI,
-		}
-
-		opts := cliproxyexecutor.Options{
-			Stream:         true,
-			SourceFormat:   sdktranslator.FormatOpenAI,
-			OriginalRequest: requestJSON,
 		}
 
 		// Execute stream directly with the specific auth (not load-balanced)
@@ -2730,13 +2829,13 @@ func (h *Handler) CheckAuthFileModelsHealth(c *gin.Context) {
 	proxyUsed := h.authManager.ProxyUsedForAuth(targetAuth)
 
 	c.JSON(http.StatusOK, gin.H{
-		"auth_id":        targetAuth.ID,
-		"status":         overallStatus,
-		"proxy_used":     proxyUsed,
-		"healthy_count":  healthyCount,
+		"auth_id":         targetAuth.ID,
+		"status":          overallStatus,
+		"proxy_used":      proxyUsed,
+		"healthy_count":   healthyCount,
 		"unhealthy_count": unhealthyCount,
-		"total_count":    len(results),
-		"models":         results,
+		"total_count":     len(results),
+		"models":          results,
 	})
 }
 
@@ -2774,15 +2873,7 @@ func (h *Handler) checkAuthFileModelsHealthStream(c *gin.Context, targetAuth *co
 		startTime := time.Now()
 		checkCtx, cancel := context.WithTimeout(streamCtx, time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
-		openAIRequest := map[string]interface{}{
-			"model": model.ID,
-			"messages": []map[string]interface{}{
-				{"role": "user", "content": "hi"},
-				{"role": "system", "content": "test"},
-			},
-			"stream": true, "max_tokens": 1,
-		}
-		requestJSON, err := json.Marshal(openAIRequest)
+		req, opts, err := healthcheck.BuildProbeRequest(targetAuth, model.ID)
 		if err != nil {
 			resultCh <- ModelHealth{
 				ModelID: model.ID, DisplayName: model.DisplayName,
@@ -2790,8 +2881,6 @@ func (h *Handler) checkAuthFileModelsHealthStream(c *gin.Context, targetAuth *co
 			}
 			return
 		}
-		req := cliproxyexecutor.Request{Model: model.ID, Payload: requestJSON, Format: sdktranslator.FormatOpenAI}
-		opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: requestJSON}
 		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, targetAuth, req, opts)
 		if err != nil {
 			resultCh <- ModelHealth{
@@ -2809,12 +2898,18 @@ func (h *Handler) checkAuthFileModelsHealthStream(c *gin.Context, targetAuth *co
 						Status: "unhealthy", Message: chunk.Err.Error(),
 					}
 					cancel()
-					go func() { for range stream {} }()
+					go func() {
+						for range stream {
+						}
+					}()
 					return
 				}
 				latency := time.Since(startTime).Milliseconds()
 				cancel()
-				go func() { for range stream {} }()
+				go func() {
+					for range stream {
+					}
+				}()
 				resultCh <- ModelHealth{
 					ModelID: model.ID, DisplayName: model.DisplayName,
 					Status: "healthy", Latency: latency,

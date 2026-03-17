@@ -62,6 +62,7 @@ type DefaultRoutingEngine struct {
 	authManager   *coreauth.Manager
 	routeActivity *RouteActivityTracker
 	healthChecker HealthChecker
+	hookExecutor  *HookExecutor
 
 	mu            sync.RWMutex
 	routeIndex    map[string]*Route    // name -> route
@@ -102,6 +103,11 @@ func NewRoutingEngine(
 	_ = engine.Reload(context.Background())
 
 	return engine
+}
+
+// SetHookExecutor attaches a hook executor for post-attempt callbacks.
+func (e *DefaultRoutingEngine) SetHookExecutor(he *HookExecutor) {
+	e.hookExecutor = he
 }
 
 func (e *DefaultRoutingEngine) Route(ctx context.Context, modelName string) (*RoutingDecision, error) {
@@ -512,12 +518,19 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
 					Success(attemptLatency)
 
+				e.fireHook(HookAttemptEvent{
+					RouteID: decision.RouteID, RouteName: decision.RouteName,
+					TargetID: target.ID, CredentialID: target.CredentialID,
+					Model: target.Model, Success: true,
+				})
+
 				trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
 				e.metrics.RecordRequest(trace)
 				return nil
 			}
 
 			errClass := ClassifyError(err)
+			statusCode := extractStatusCode(err)
 
 			if errClass == ErrorClassNonRetryable {
 				traceBuilder.AddAttempt(layer.Level, target.ID, target.CredentialID, target.Model).
@@ -530,6 +543,13 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 						"error_class": errClass.String(),
 					},
 				})
+
+				e.fireHook(HookAttemptEvent{
+					RouteID: decision.RouteID, RouteName: decision.RouteName,
+					TargetID: target.ID, CredentialID: target.CredentialID,
+					Model: target.Model, StatusCode: statusCode, Err: err,
+				})
+
 				log.Debugf("[UnifiedRouting] Non-retryable error, returning immediately: %v", err)
 				trace := traceBuilder.Build(time.Since(startTime).Milliseconds())
 				e.metrics.RecordRequest(trace)
@@ -549,6 +569,12 @@ func (e *DefaultRoutingEngine) ExecuteWithFailover(
 					"reason":      err.Error(),
 					"error_class": errClass.String(),
 				},
+			})
+
+			e.fireHook(HookAttemptEvent{
+				RouteID: decision.RouteID, RouteName: decision.RouteName,
+				TargetID: target.ID, CredentialID: target.CredentialID,
+				Model: target.Model, StatusCode: statusCode, Err: err,
 			})
 
 			availableTargets = append(availableTargets[:idx], availableTargets[idx+1:]...)
@@ -925,4 +951,27 @@ type AllTargetsExhaustedError struct {
 
 func (e *AllTargetsExhaustedError) Error() string {
 	return fmt.Sprintf("all targets exhausted for route: %s", e.RouteID)
+}
+
+// fireHook evaluates and runs hooks if a HookExecutor is attached.
+func (e *DefaultRoutingEngine) fireHook(evt HookAttemptEvent) {
+	if e.hookExecutor != nil {
+		e.hookExecutor.EvaluateAndRun(evt)
+	}
+}
+
+// extractStatusCode extracts the HTTP status code from an error, if available.
+func extractStatusCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var statusErr cliproxyexecutor.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode()
+	}
+	var authErr *coreauth.Error
+	if errors.As(err, &authErr) {
+		return authErr.HTTPStatus
+	}
+	return 0
 }

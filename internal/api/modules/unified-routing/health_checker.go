@@ -2,14 +2,12 @@ package unifiedrouting
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/healthcheck"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -41,14 +39,14 @@ type HealthChecker interface {
 
 // DefaultHealthChecker implements HealthChecker.
 type DefaultHealthChecker struct {
-	configSvc       ConfigService
-	stateMgr        StateManager
-	metrics         MetricsCollector
-	authManager     *coreauth.Manager
-	routeActivity   *RouteActivityTracker
+	configSvc     ConfigService
+	stateMgr      StateManager
+	metrics       MetricsCollector
+	authManager   *coreauth.Manager
+	routeActivity *RouteActivityTracker
 
-	mu        sync.RWMutex
-	history   []*HealthResult
+	mu         sync.RWMutex
+	history    []*HealthResult
 	maxHistory int
 
 	// Per-target scheduled health check timers.
@@ -56,7 +54,7 @@ type DefaultHealthChecker struct {
 	timerMu         sync.Mutex
 	scheduledTimers map[string]*time.Timer
 
-	running  bool
+	running bool
 }
 
 // NewHealthChecker creates a new health checker.
@@ -232,17 +230,7 @@ func (h *DefaultHealthChecker) performHealthCheck(ctx context.Context, target *T
 		return result
 	}
 
-	// Build minimal request for health check
-	openAIRequest := map[string]interface{}{
-		"model": target.Model,
-		"messages": []map[string]interface{}{
-			{"role": "user", "content": "hi"},
-		},
-		"stream":     true,
-		"max_tokens": 1,
-	}
-
-	requestJSON, err := json.Marshal(openAIRequest)
+	req, opts, err := healthcheck.BuildProbeRequest(targetAuth, target.Model)
 	if err != nil {
 		result.Status = "unhealthy"
 		result.Message = "failed to build request"
@@ -260,19 +248,6 @@ func (h *DefaultHealthChecker) performHealthCheck(ctx context.Context, target *T
 	defer cancel()
 
 	startTime := time.Now()
-
-	// Execute health check request
-	req := cliproxyexecutor.Request{
-		Model:   target.Model,
-		Payload: requestJSON,
-		Format:  sdktranslator.FormatOpenAI,
-	}
-
-	opts := cliproxyexecutor.Options{
-		Stream:          true,
-		SourceFormat:    sdktranslator.FormatOpenAI,
-		OriginalRequest: requestJSON,
-	}
 
 	stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, targetAuth, req, opts)
 	if err != nil {

@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,12 +10,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/healthcheck"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
 // ProviderInfo represents information about a configured provider
@@ -209,17 +207,7 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 		checkCtx, cancel := context.WithTimeout(usage.WithSkipUsage(context.Background()), time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
 
-		openAIRequest := map[string]interface{}{
-			"model": testModel.ID,
-			"messages": []map[string]interface{}{
-				{"role": "user", "content": "hi"},
-				{"role": "system", "content": "test"},
-			},
-			"stream":     true,
-			"max_tokens": 1,
-		}
-
-		requestJSON, err := json.Marshal(openAIRequest)
+		req, opts, err := healthcheck.BuildProbeRequest(auth, testModel.ID)
 		if err != nil {
 			mu.Lock()
 			results = append(results, ProviderHealth{
@@ -235,18 +223,6 @@ func (h *Handler) CheckProvidersHealth(c *gin.Context) {
 			})
 			mu.Unlock()
 			return
-		}
-
-		req := cliproxyexecutor.Request{
-			Model:   testModel.ID,
-			Payload: requestJSON,
-			Format:  sdktranslator.FormatOpenAI,
-		}
-
-		opts := cliproxyexecutor.Options{
-			Stream:          true,
-			SourceFormat:    sdktranslator.FormatOpenAI,
-			OriginalRequest: requestJSON,
 		}
 
 		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, auth, req, opts)
@@ -484,15 +460,7 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 		startTime := time.Now()
 		checkCtx, cancel := context.WithTimeout(streamCtx, time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
-		openAIRequest := map[string]interface{}{
-			"model": testModel.ID,
-			"messages": []map[string]interface{}{
-				{"role": "user", "content": "hi"},
-				{"role": "system", "content": "test"},
-			},
-			"stream": true, "max_tokens": 1,
-		}
-		requestJSON, err := json.Marshal(openAIRequest)
+		req, opts, err := healthcheck.BuildProbeRequest(auth, testModel.ID)
 		if err != nil {
 			resultCh <- ProviderHealth{
 				ID: auth.ID, Name: auth.Provider, Type: providerType,
@@ -502,8 +470,6 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 			}
 			return
 		}
-		req := cliproxyexecutor.Request{Model: testModel.ID, Payload: requestJSON, Format: sdktranslator.FormatOpenAI}
-		opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: requestJSON}
 		stream, err := h.authManager.ExecuteStreamWithAuth(checkCtx, auth, req, opts)
 		if err != nil {
 			resultCh <- ProviderHealth{
@@ -523,12 +489,18 @@ func (h *Handler) checkProvidersHealthStream(c *gin.Context, targetAuths []*core
 						Status: "unhealthy", Message: chunk.Err.Error(), ModelTested: testModel.ID,
 					}
 					cancel()
-					go func() { for range stream {} }()
+					go func() {
+						for range stream {
+						}
+					}()
 					return
 				}
 				latency := time.Since(startTime).Milliseconds()
 				cancel()
-				go func() { for range stream {} }()
+				go func() {
+					for range stream {
+					}
+				}()
 				resultCh <- ProviderHealth{
 					ID: auth.ID, Name: auth.Provider, Type: providerType,
 					Label: auth.Label, Prefix: auth.Prefix, BaseURL: baseURL,
@@ -584,7 +556,7 @@ done:
 				ID: t.auth.ID, Name: t.auth.Provider, Type: providerType,
 				Label: t.auth.Label, Prefix: t.auth.Prefix,
 				BaseURL: authAttribute(t.auth, "base_url"),
-				Status: "timeout", Message: "超过30s未完成",
+				Status:  "timeout", Message: "超过30s未完成",
 				ModelTested: modelID,
 			})
 		}

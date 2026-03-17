@@ -53,6 +53,23 @@ _bmad-output/*
 _AGENT/
 **/credentials.json
 
+# Logs
+_logs/
+
+# Temp build artifacts
+_scripts/.tmp/
+
+# Hook runtime artifacts (tokens, venvs, proxy configs, state)
+hook-scripts/**/output/
+hook-scripts/**/.venv/
+hook-scripts/**/config.json
+hook-scripts/**/.rotation_state
+
+# Experiments with binaries/credentials
+_experiments/01_antigravity-reverse/Antigravity/
+_experiments/01_antigravity-reverse/.adc_credentials.json
+
 # macOS
 .DS_Store
-._*
+._*_reference/antigravity-cli/
+_reference/Antigravity.tar.gz
