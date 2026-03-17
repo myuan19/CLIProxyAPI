@@ -53,3 +53,22 @@ _bmad-output/*
 .DEV/experiments
 .DEV/static/*
 !.DEV/static/management.html
+
+# Hook scripts — runtime artifacts contain secrets (tokens, proxy pools, state)
+hook-scripts/**/output/
+hook-scripts/**/.venv/
+hook-scripts/**/config.json
+hook-scripts/**/.rotation_state
+
+# Logs, experiments, references, notes, scripts (not needed in image)
+_logs/
+_experiments/
+_reference/
+_notes/
+_docs/
+_scripts/
+_AGENT/
+
+# Credentials
+**/credentials.json
+**/.adc_credentials.json
