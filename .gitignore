@@ -46,30 +46,24 @@ GEMINI.md
 .agents/*
 .opencode/*
 .bmad/*
-_bmad/*
-_bmad-output/*
 
-# Agent experiments (may contain credentials, tokens, sensitive data)
-_AGENT/
-**/credentials.json
-
-# Logs
+# All _ prefixed directories — private/sensitive (experiments, notes, scripts, docs, logs, agent data)
+_experiments/
+_notes/
+_scripts/
+_docs/
 _logs/
+_reference/
+_AGENT/
+_bmad/
+_bmad-output/
 
-# Temp build artifacts
-_scripts/.tmp/
+# Hook scripts — contains secrets, proxy pools, registration scripts
+hook-scripts/
 
-# Hook runtime artifacts (tokens, venvs, proxy configs, state)
-hook-scripts/**/output/
-hook-scripts/**/.venv/
-hook-scripts/**/config.json
-hook-scripts/**/.rotation_state
-
-# Experiments with binaries/credentials
-_experiments/01_antigravity-reverse/Antigravity/
-_experiments/01_antigravity-reverse/.adc_credentials.json
+# Credentials
+**/credentials.json
 
 # macOS
 .DS_Store
-._*_reference/antigravity-cli/
-_reference/Antigravity.tar.gz
+._*

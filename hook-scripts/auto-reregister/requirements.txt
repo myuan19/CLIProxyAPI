@@ -1,3 +1,0 @@
-curl_cffi>=0.5.0
-# 可选：ss:// 代理支持
-singbox2proxy>=0.2.0
