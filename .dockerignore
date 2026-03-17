@@ -67,6 +67,7 @@ _reference/
 _notes/
 _docs/
 _scripts/
+!_scripts/.tmp/static/management.html
 _AGENT/
 
 # Credentials
