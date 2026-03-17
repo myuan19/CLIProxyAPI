@@ -1042,9 +1042,12 @@ EOF
         read -r -p "是否继续推送？(y/N) " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             write_command "docker push $FULL_IMAGE_NAME" "推送镜像到远程仓库（需要网络，可能需要几分钟）"
-            docker push "$FULL_IMAGE_NAME"
-
-            echo -e "${GREEN}✓ 镜像已推送到: $FULL_IMAGE_NAME${NC}"
+            if docker push "$FULL_IMAGE_NAME"; then
+                echo -e "${GREEN}✓ 镜像已推送到: $FULL_IMAGE_NAME${NC}"
+            else
+                echo -e "${RED}✗ 镜像推送失败，请检查网络连接或 docker login 状态${NC}"
+                echo -e "${YELLOW}可手动重试: docker push $FULL_IMAGE_NAME${NC}"
+            fi
         else
             echo -e "${YELLOW}已跳过推送${NC}"
         fi
